@@ -1,0 +1,6 @@
+{
+  "name": "Baby",
+  "description": "A complete offline-first full-stack AI assistant for Android with text, voice, long-term memory, and local llama.cpp support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
