@@ -92,7 +92,7 @@ class BabyViewModel(
     private val _apiKey = MutableStateFlow("")
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
-    private val _geminiModel = MutableStateFlow("gemini-3.5-flash")
+    private val _geminiModel = MutableStateFlow("gemini-2.5-flash")
     val geminiModel: StateFlow<String> = _geminiModel.asStateFlow()
 
     private val _voicePitch = MutableStateFlow(1.0f)
@@ -225,7 +225,7 @@ class BabyViewModel(
         // Load initial settings from DB
         viewModelScope.launch {
             _apiKey.value = repository.getSetting("api_key", "")
-            _geminiModel.value = repository.getSetting("gemini_model", "gemini-3.5-flash")
+            _geminiModel.value = repository.getSetting("gemini_model", "gemini-2.5-flash")
             _voicePitch.value = repository.getSetting("voice_pitch", "1.0").toFloatOrNull() ?: 1.0f
             _voiceRate.value = repository.getSetting("voice_rate", "1.0").toFloatOrNull() ?: 1.0f
             _voiceStyle.value = repository.getSetting("voice_style", "default")
@@ -678,7 +678,7 @@ class BabyViewModel(
             generationConfig = generationConfig
         )
 
-        val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.5-flash" }
+        val modelToUse = _geminiModel.value.ifEmpty { "gemini-2.5-flash" }
 
         val apiResponse = ApiClients.geminiService.generateContent(
             model = modelToUse,
@@ -807,7 +807,7 @@ class BabyViewModel(
                 )
 
                 val response = ApiClients.geminiService.generateContent(
-                    model = "gemini-3.5-flash",
+                    model = "gemini-2.5-flash",
                     apiKey = resolvedKey,
                     request = request
                 )
@@ -1247,7 +1247,7 @@ suspend fun callOnlineAIWrapper(
         systemInstruction = systemInstruction
     )
 
-    val modelToUse = repository?.getSetting("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
+    val modelToUse = repository?.getSetting("gemini_model", "gemini-2.5-flash") ?: "gemini-2.5-flash"
 
     val apiResponse = ApiClients.geminiService.generateContent(
         model = modelToUse,
