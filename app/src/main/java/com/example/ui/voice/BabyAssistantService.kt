@@ -31,7 +31,6 @@ import com.example.data.local.DeviceControlManager
 import com.example.data.local.db.AppDatabase
 import com.example.data.repository.BabyRepository
 import com.example.ui.viewmodel.AssistantState
-import com.example.ui.viewmodel.callOfflineAIWrapper
 import com.example.ui.viewmodel.callOnlineAIWrapper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -348,20 +347,13 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        // 2. Otherwise fall back to online/offline AI response
+        // 2. Otherwise fall back to Gemini AI response
         updateNotificationText("BabyAI: Thinking...")
         try {
-            val isOffline = repository?.getSetting("is_offline_mode", "false").toBoolean()
             val apiKey = repository?.getSetting("api_key", "") ?: ""
-            val backendUrl = repository?.getSetting("backend_url", "http://10.0.2.2:5000/") ?: ""
-
             val messagesHistory = listOf(mapOf("role" to "user", "content" to commandText))
             
-            val aiResponse = if (isOffline) {
-                callOfflineAIWrapper(commandText, messagesHistory, repository)
-            } else {
-                callOnlineAIWrapper(commandText, messagesHistory, apiKey, repository)
-            }
+            val aiResponse = callOnlineAIWrapper(commandText, messagesHistory, apiKey, repository)
 
             repository?.addMessage(activeConvId, "assistant", aiResponse)
             speak(aiResponse)
@@ -595,18 +587,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         scope.launch {
             monitor.isConnected.collect { available ->
                 val repo = repository ?: return@collect
-                val isAutoSwitchEnabled = repo.getSetting("is_auto_switch_enabled", "true").toBoolean()
-                if (isAutoSwitchEnabled) {
-                    val targetOfflineMode = !available
-                    val currentOfflineMode = repo.getSetting("is_offline_mode", "false").toBoolean()
-                    if (currentOfflineMode != targetOfflineMode) {
-                        repo.saveSetting("is_offline_mode", targetOfflineMode.toString())
-                        repo.addLog(
-                            "Network_AutoSwitch",
-                            "Background service detected connection change. Switched AI core to ${if (targetOfflineMode) "Local Llama.cpp (Offline)" else "Gemini Cloud (Online)"}"
-                        )
-                    }
-                }
+                repo.addLog("Voice_Service", "Network connectivity: ${if (available) "CONNECTED" else "DISCONNECTED"}")
             }
         }
     }

@@ -44,8 +44,6 @@ fun HomeScreen(
     val rmsDb by viewModel.rmsDb.collectAsState()
     val partialText by viewModel.partialSpeechText.collectAsState()
     val isContinuousMode by viewModel.isContinuousMode.collectAsState()
-    val isOfflineMode by viewModel.isOfflineMode.collectAsState()
-    val backendHealth by viewModel.backendHealth.collectAsState()
     val isInternetAvailable by viewModel.isInternetAvailable.collectAsState()
 
     val primaryGradient = Brush.verticalGradient(
@@ -80,7 +78,7 @@ fun HomeScreen(
                     letterSpacing = 2.sp
                 )
                 Text(
-                    text = if (isOfflineMode) "Local Private Intelligence" else if (!isInternetAvailable) "Offline Fallback Active" else "Cloud Core Syncing",
+                    text = if (isInternetAvailable) "Gemini AI Connected" else "No Internet Connection",
                     color = Color.White.copy(alpha = 0.5f),
                     fontSize = 12.sp
                 )
@@ -91,27 +89,14 @@ fun HomeScreen(
                 modifier = Modifier
                     .clip(RoundedCornerShape(20.dp))
                     .background(
-                        if (isOfflineMode) {
-                            if (backendHealth) Color(0xFF10B981).copy(alpha = 0.15f) else Color(0xFFEF4444).copy(alpha = 0.15f)
-                        } else if (!isInternetAvailable) {
-                            if (backendHealth) Color(0xFFF59E0B).copy(alpha = 0.15f) else Color(0xFFEF4444).copy(alpha = 0.15f)
-                        } else {
-                            Color(0xFF3B82F6).copy(alpha = 0.15f)
-                        }
+                        if (isInternetAvailable) Color(0xFF10B981).copy(alpha = 0.15f) else Color(0xFFEF4444).copy(alpha = 0.15f)
                     )
                     .border(
                         width = 1.dp,
-                        color = if (isOfflineMode) {
-                            if (backendHealth) Color(0xFF10B981) else Color(0xFFEF4444)
-                        } else if (!isInternetAvailable) {
-                            if (backendHealth) Color(0xFFF59E0B) else Color(0xFFEF4444)
-                        } else {
-                            Color(0xFF3B82F6)
-                        },
+                        color = if (isInternetAvailable) Color(0xFF10B981) else Color(0xFFEF4444),
                         shape = RoundedCornerShape(20.dp)
                     )
                     .padding(horizontal = 12.dp, vertical = 6.dp)
-                    .clickable { viewModel.checkBackendHealth() }
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -122,23 +107,11 @@ fun HomeScreen(
                             .size(8.dp)
                             .clip(CircleShape)
                             .background(
-                                if (isOfflineMode) {
-                                    if (backendHealth) Color(0xFF10B981) else Color(0xFFEF4444)
-                                } else if (!isInternetAvailable) {
-                                    if (backendHealth) Color(0xFFF59E0B) else Color(0xFFEF4444)
-                                } else {
-                                    Color(0xFF3B82F6)
-                                }
+                                if (isInternetAvailable) Color(0xFF10B981) else Color(0xFFEF4444)
                             )
                     )
                     Text(
-                        text = if (isOfflineMode) {
-                            if (backendHealth) "Offline Server OK" else "Server Offline"
-                        } else if (!isInternetAvailable) {
-                            if (backendHealth) "Offline Fallback" else "Connection Alert"
-                        } else {
-                            "Online Mode"
-                        },
+                        text = if (isInternetAvailable) "Gemini Active" else "Offline",
                         color = Color.White,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold

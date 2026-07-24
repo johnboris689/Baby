@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.content.Intent
 import android.widget.Toast
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,12 +36,8 @@ fun SettingsScreen(
     onNavigateBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val isOfflineMode by viewModel.isOfflineMode.collectAsState()
-    val isAutoSwitchEnabled by viewModel.isAutoSwitchEnabled.collectAsState()
-    val provider by viewModel.selectedProvider.collectAsState()
     val apiKey by viewModel.apiKey.collectAsState()
-    val backendUrl by viewModel.backendUrl.collectAsState()
-    val llamaUrl by viewModel.llamaUrl.collectAsState()
+    val geminiModel by viewModel.geminiModel.collectAsState()
     val voicePitch by viewModel.voicePitch.collectAsState()
     val voiceRate by viewModel.voiceRate.collectAsState()
     val voiceStyle by viewModel.voiceStyle.collectAsState()
@@ -48,7 +45,6 @@ fun SettingsScreen(
     val availableVoices by viewModel.availableVoices.collectAsState()
     val isContinuousMode by viewModel.isContinuousMode.collectAsState()
     val silenceThreshold by viewModel.silenceThreshold.collectAsState()
-    val backendHealth by viewModel.backendHealth.collectAsState()
     val logs by viewModel.logs.collectAsState()
 
     val batteryLevel by viewModel.batteryLevel.collectAsState()
@@ -100,194 +96,116 @@ fun SettingsScreen(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // --- AI Core Mode Section ---
+            // --- Gemini AI Configuration Section ---
             item {
-                SettingsSectionCard(title = "AI Engine Core") {
-                    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "Auto-Switch AI Engine",
-                                    color = Color.White,
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Text(
-                                    text = "Automatically switches to local Llama.cpp when offline, and Gemini Cloud API when online",
-                                    color = Color.White.copy(alpha = 0.5f),
-                                    fontSize = 11.sp
-                                )
-                            }
-                            Switch(
-                                checked = isAutoSwitchEnabled,
-                                onCheckedChange = { viewModel.saveSetting("is_auto_switch_enabled", it.toString()) },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = Color(0xFF3B82F6),
-                                    checkedTrackColor = Color(0xFF3B82F6).copy(alpha = 0.3f)
-                                ),
-                                modifier = Modifier.testTag("auto_switch_switch")
+                SettingsSectionCard(title = "Gemini AI Configuration") {
+                    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Text("Gemini API Key", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+
+                        OutlinedTextField(
+                            value = apiKey,
+                            onValueChange = { viewModel.saveSetting("api_key", it) },
+                            placeholder = { Text("Enter Gemini API Key...", color = Color.White.copy(alpha = 0.3f)) },
+                            visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { showApiKey = !showApiKey }) {
+                                    Icon(
+                                        imageVector = if (showApiKey) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
+                                        contentDescription = "Toggle API Key Visibility",
+                                        tint = Color.White.copy(alpha = 0.5f)
+                                    )
+                                }
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Color(0xFF3B82F6),
+                                unfocusedBorderColor = Color.White.copy(alpha = 0.15f),
+                                focusedContainerColor = Color.White.copy(alpha = 0.03f),
+                                unfocusedContainerColor = Color.White.copy(alpha = 0.03f)
+                            ),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("api_key_field")
+                        )
+
+                        if (apiKey.isEmpty()) {
+                            Text(
+                                text = "Please enter your Gemini API key above to enable AI responses.",
+                                color = Color(0xFFF59E0B),
+                                fontSize = 11.sp
                             )
                         }
 
-                        Divider(color = Color.White.copy(alpha = 0.05f))
+                        Spacer(modifier = Modifier.height(2.dp))
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "Manual Offline-First Mode",
-                                    color = if (isAutoSwitchEnabled) Color.White.copy(alpha = 0.4f) else Color.White,
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Text(
-                                    text = if (isOfflineMode) "Uses local llama.cpp server" else "Uses cloud-based Gemini Core API",
-                                    color = Color.White.copy(alpha = 0.5f),
-                                    fontSize = 11.sp
-                                )
-                            }
-                            Switch(
-                                checked = isOfflineMode,
-                                enabled = !isAutoSwitchEnabled,
-                                onCheckedChange = { viewModel.saveSetting("is_offline_mode", it.toString()) },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = Color(0xFF10B981),
-                                    checkedTrackColor = Color(0xFF10B981).copy(alpha = 0.3f)
-                                ),
-                                modifier = Modifier.testTag("offline_mode_switch")
-                            )
-                        }
-                    }
-                }
-            }
+                        Text("Gemini Model", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
 
-            // --- Online API Provider Settings ---
-            if (!isOfflineMode) {
-                item {
-                    SettingsSectionCard(title = "Online Provider Config") {
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text("API Provider", color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp)
+                        val availableModels = listOf(
+                            "gemini-3.5-flash" to "Gemini 3.5 Flash (Recommended)",
+                            "gemini-3.1-pro-preview" to "Gemini 3.1 Pro (Deep Reasoning)",
+                            "gemini-3.1-flash-lite-preview" to "Gemini 3.1 Flash Lite (Ultra Fast)",
+                            "gemini-2.5-flash" to "Gemini 2.5 Flash",
+                            "gemini-flash-latest" to "Gemini Flash Latest"
+                        )
 
-                            Row(
+                        var expandedModelDropdown by remember { mutableStateOf(false) }
+                        val currentSelectedModelLabel = availableModels.find { it.first == geminiModel }?.second ?: geminiModel.ifEmpty { "Gemini 3.5 Flash (Recommended)" }
+
+                        Box {
+                            OutlinedButton(
+                                onClick = { expandedModelDropdown = true },
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                listOf("gemini", "openai", "openrouter").forEach { prov ->
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .clip(RoundedCornerShape(8.dp))
-                                            .background(if (provider == prov) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.05f))
-                                            .clickable { viewModel.saveSetting("selected_provider", prov) }
-                                            .padding(vertical = 8.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Text(
-                                            text = prov.uppercase(),
-                                            color = Color.White,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            Text("API Key", color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp)
-
-                            TextField(
-                                value = apiKey,
-                                onValueChange = { viewModel.saveSetting("api_key", it) },
-                                placeholder = { Text("Enter private key...") },
-                                visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-                                trailingIcon = {
-                                    IconButton(onClick = { showApiKey = !showApiKey }) {
-                                        Icon(
-                                            imageVector = if (showApiKey) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
-                                            contentDescription = null,
-                                            tint = Color.White.copy(alpha = 0.4f)
-                                        )
-                                    }
-                                },
-                                colors = TextFieldDefaults.colors(
-                                    focusedTextColor = Color.White,
-                                    unfocusedTextColor = Color.White,
-                                    focusedContainerColor = Color.White.copy(alpha = 0.05f),
-                                    unfocusedContainerColor = Color.White.copy(alpha = 0.05f)
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = Color.White,
+                                    containerColor = Color.White.copy(alpha = 0.03f)
                                 ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("api_key_field")
-                            )
-                        }
-                    }
-                }
-            } else {
-                // --- Offline llama.cpp Server Settings ---
-                item {
-                    SettingsSectionCard(title = "Local Server Configuration") {
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            // Connection test
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (backendHealth) Color(0xFF10B981).copy(alpha = 0.08f) else Color(0xFFEF4444).copy(alpha = 0.08f))
-                                    .border(1.dp, if (backendHealth) Color(0xFF10B981) else Color(0xFFEF4444), RoundedCornerShape(8.dp))
-                                    .padding(12.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.15f))
                             ) {
-                                Text(
-                                    text = if (backendHealth) "Local server connected successfully" else "Could not connect to local server",
-                                    color = if (backendHealth) Color(0xFF34D399) else Color(0xFFF87171),
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-
-                                Button(
-                                    onClick = { viewModel.checkBackendHealth() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = if (backendHealth) Color(0xFF10B981) else Color(0xFFEF4444)),
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                                    modifier = Modifier.height(28.dp)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text("Test", fontSize = 11.sp, color = Color.White)
+                                    Text(
+                                        text = currentSelectedModelLabel,
+                                        fontSize = 13.sp,
+                                        color = Color.White
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Filled.ArrowDropDown,
+                                        contentDescription = "Select Model",
+                                        tint = Color.White.copy(alpha = 0.6f)
+                                    )
                                 }
                             }
 
-                            Text("Flask API URL", color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp)
-                            TextField(
-                                value = backendUrl,
-                                onValueChange = { viewModel.saveSetting("backend_url", it) },
-                                colors = TextFieldDefaults.colors(
-                                    focusedTextColor = Color.White,
-                                    unfocusedTextColor = Color.White,
-                                    focusedContainerColor = Color.White.copy(alpha = 0.05f),
-                                    unfocusedContainerColor = Color.White.copy(alpha = 0.05f)
-                                ),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-
-                            Text("Direct llama.cpp Port URL", color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp)
-                            TextField(
-                                value = llamaUrl,
-                                onValueChange = { viewModel.saveSetting("llama_url", it) },
-                                colors = TextFieldDefaults.colors(
-                                    focusedTextColor = Color.White,
-                                    unfocusedTextColor = Color.White,
-                                    focusedContainerColor = Color.White.copy(alpha = 0.05f),
-                                    unfocusedContainerColor = Color.White.copy(alpha = 0.05f)
-                                ),
-                                modifier = Modifier.fillMaxWidth()
-                            )
+                            DropdownMenu(
+                                expanded = expandedModelDropdown,
+                                onDismissRequest = { expandedModelDropdown = false },
+                                modifier = Modifier
+                                    .background(Color(0xFF1E293B))
+                                    .border(1.dp, Color.White.copy(alpha = 0.1f))
+                            ) {
+                                availableModels.forEach { (modelId, label) ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = label,
+                                                color = if (modelId == geminiModel) Color(0xFF60A5FA) else Color.White,
+                                                fontWeight = if (modelId == geminiModel) FontWeight.Bold else FontWeight.Normal,
+                                                fontSize = 13.sp
+                                            )
+                                        },
+                                        onClick = {
+                                            viewModel.saveSetting("gemini_model", modelId)
+                                            expandedModelDropdown = false
+                                        }
+                                    )
+                                }
+                            }
                         }
                     }
                 }

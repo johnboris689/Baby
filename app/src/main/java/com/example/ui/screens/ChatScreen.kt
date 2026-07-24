@@ -53,7 +53,6 @@ fun ChatScreen(
     val activeId by viewModel.activeConversationId.collectAsState()
     val messages by viewModel.activeMessages.collectAsState()
     val assistantState by viewModel.assistantState.collectAsState()
-    val isOfflineMode by viewModel.isOfflineMode.collectAsState()
     val isInternetAvailable by viewModel.isInternetAvailable.collectAsState()
 
     var showSidebar by remember { mutableStateOf(false) }
@@ -306,21 +305,8 @@ fun ChatScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
-                            val dotColor = if (isOfflineMode) {
-                                Color(0xFFF59E0B) // Amber for manual local
-                            } else if (!isInternetAvailable) {
-                                Color(0xFFEF4444) // Red for offline fallback
-                            } else {
-                                Color(0xFF10B981) // Green for online Gemini
-                            }
-                            
-                            val statusText = if (isOfflineMode) {
-                                "Offline (llama.cpp)"
-                            } else if (!isInternetAvailable) {
-                                "Offline Fallback"
-                            } else {
-                                "Online (Gemini)"
-                            }
+                            val dotColor = if (isInternetAvailable) Color(0xFF10B981) else Color(0xFFEF4444)
+                            val statusText = if (isInternetAvailable) "Gemini Direct AI" else "No Connection"
 
                             Box(
                                 modifier = Modifier

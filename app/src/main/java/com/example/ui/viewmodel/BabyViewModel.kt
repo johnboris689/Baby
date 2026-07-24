@@ -13,8 +13,6 @@ import com.example.data.api.GeminiContent
 import com.example.data.api.GeminiPart
 import com.example.data.api.GeminiRequest
 import com.example.data.api.GeminiGenerationConfig
-import com.example.data.api.ChatRequest
-import com.example.data.api.LlamaCompletionRequest
 import com.example.data.local.entity.ConversationEntity
 import com.example.data.local.entity.LogEntity
 import com.example.data.local.entity.MemoryEntity
@@ -61,9 +59,6 @@ class BabyViewModel(
     private val _partialSpeechText = MutableStateFlow("")
     val partialSpeechText: StateFlow<String> = _partialSpeechText.asStateFlow()
 
-    private val _backendHealth = MutableStateFlow(false)
-    val backendHealth: StateFlow<Boolean> = _backendHealth.asStateFlow()
-
     // --- Conversational State ---
     val conversations: StateFlow<List<ConversationEntity>> = repository.allConversations
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -89,28 +84,16 @@ class BabyViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // --- Configuration State ---
-    private val _isOfflineMode = MutableStateFlow(false)
-    val isOfflineMode: StateFlow<Boolean> = _isOfflineMode.asStateFlow()
-
-    private val _isAutoSwitchEnabled = MutableStateFlow(true)
-    val isAutoSwitchEnabled: StateFlow<Boolean> = _isAutoSwitchEnabled.asStateFlow()
-
     private val deviceControlManager = DeviceControlManager(application)
     private val networkMonitor = NetworkMonitor(application)
     private val _isInternetAvailable = MutableStateFlow(true)
     val isInternetAvailable: StateFlow<Boolean> = _isInternetAvailable.asStateFlow()
 
-    private val _selectedProvider = MutableStateFlow("gemini")
-    val selectedProvider: StateFlow<String> = _selectedProvider.asStateFlow()
-
     private val _apiKey = MutableStateFlow("")
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
-    private val _backendUrl = MutableStateFlow("http://10.0.2.2:5000/")
-    val backendUrl: StateFlow<String> = _backendUrl.asStateFlow()
-
-    private val _llamaUrl = MutableStateFlow("http://10.0.2.2:8080/")
-    val llamaUrl: StateFlow<String> = _llamaUrl.asStateFlow()
+    private val _geminiModel = MutableStateFlow("gemini-3.5-flash")
+    val geminiModel: StateFlow<String> = _geminiModel.asStateFlow()
 
     private val _voicePitch = MutableStateFlow(1.0f)
     val voicePitch: StateFlow<Float> = _voicePitch.asStateFlow()
@@ -212,8 +195,6 @@ class BabyViewModel(
 
     private var activeGenerationJob: Job? = null
 
-    private var healthCheckJob: Job? = null
-
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
@@ -238,29 +219,13 @@ class BabyViewModel(
             networkMonitor.isConnected.collect { available ->
                 _isInternetAvailable.value = available
                 repository.addLog("Network", "Internet status changed: ${if (available) "CONNECTED" else "DISCONNECTED"}")
-                
-                if (_isAutoSwitchEnabled.value) {
-                    val targetOfflineMode = !available
-                    if (_isOfflineMode.value != targetOfflineMode) {
-                        _isOfflineMode.value = targetOfflineMode
-                        repository.saveSetting("is_offline_mode", targetOfflineMode.toString())
-                        repository.addLog(
-                            "Network_AutoSwitch",
-                            "Auto-switched AI engine to ${if (targetOfflineMode) "Local Llama.cpp (Offline)" else "Gemini Cloud (Online)"}"
-                        )
-                    }
-                }
             }
         }
 
         // Load initial settings from DB
         viewModelScope.launch {
-            _isAutoSwitchEnabled.value = repository.getSetting("is_auto_switch_enabled", "true").toBoolean()
-            _isOfflineMode.value = repository.getSetting("is_offline_mode", "false").toBoolean()
-            _selectedProvider.value = repository.getSetting("selected_provider", "gemini")
             _apiKey.value = repository.getSetting("api_key", "")
-            _backendUrl.value = repository.getSetting("backend_url", "http://10.0.2.2:5000/")
-            _llamaUrl.value = repository.getSetting("llama_url", "http://10.0.2.2:8080/")
+            _geminiModel.value = repository.getSetting("gemini_model", "gemini-3.5-flash")
             _voicePitch.value = repository.getSetting("voice_pitch", "1.0").toFloatOrNull() ?: 1.0f
             _voiceRate.value = repository.getSetting("voice_rate", "1.0").toFloatOrNull() ?: 1.0f
             _voiceStyle.value = repository.getSetting("voice_style", "default")
@@ -305,9 +270,6 @@ class BabyViewModel(
             } ?: run {
                 createNewConversation("Baby AI Chat")
             }
-
-            // Start periodic health check with frequency matching current power save state
-            startHealthCheckTimer()
 
             // Generate semantic embeddings for existing memories that lack them
             initializeMemoriesWithEmbeddings()
@@ -555,10 +517,6 @@ class BabyViewModel(
                         saveSetting("force_power_save", "true")
                         updatePowerSaveState()
                     }
-                    "OFFLINE_AI" -> {
-                        saveSetting("is_offline_mode", "true")
-                        _isOfflineMode.value = true
-                    }
                     "ADD_LOG" -> {
                         repository.addLog("System", "Automation script ran successfully.")
                     }
@@ -607,11 +565,7 @@ class BabyViewModel(
                     mapOf("role" to it.role, "content" to it.content)
                 }
 
-                val responseText = if (_isOfflineMode.value || !_isInternetAvailable.value) {
-                    callOfflineAI(finalPrompt, activeMsgHistory)
-                } else {
-                    callOnlineAI(finalPrompt, activeMsgHistory)
-                }
+                val responseText = callOnlineAI(finalPrompt, activeMsgHistory)
 
                 // Simulate token-by-token response streaming
                 simulateStreamingText(responseText, convId)
@@ -667,7 +621,7 @@ class BabyViewModel(
     private suspend fun callOnlineAI(prompt: String, history: List<Map<String, String>>): String = withContext(Dispatchers.IO) {
         val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
         if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
-            throw IllegalStateException("API Key is missing. Please enter it in Settings or configure the Secrets Panel.")
+            return@withContext "Welcome to Baby! Please enter your Gemini API Key in Settings to enable AI responses."
         }
 
         repository.addLog("AI_Call", "Calling Gemini API (Power-Save Active: ${_isPowerSaveActive.value})...")
@@ -682,7 +636,7 @@ class BabyViewModel(
         // Build Gemini request with system instructions and user history
         val isPowerSave = _isPowerSaveActive.value
         val isDeepThinking = _thinkingMode.value == "deep"
-        val systemInstructionText = "You are Baby, a natural, emotionally intelligent offline-first AI assistant for Android. " +
+        val systemInstructionText = "You are Baby, a natural, emotionally intelligent AI assistant for Android. " +
                 "Use the local memories if provided. Keep your answers concise, engaging, and friendly." +
                 (if (isPowerSave) " Power-save mode is active: restrict responses to be extremely short (under 15 words) to conserve battery." else "") +
                 (if (isDeepThinking) " Please think deeply. Start your response with your step-by-step reasoning process inside <thinking>...</thinking> XML tags. For example: <thinking>To answer your question...</thinking> Here is the answer." else "")
@@ -724,75 +678,16 @@ class BabyViewModel(
             generationConfig = generationConfig
         )
 
+        val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.5-flash" }
+
         val apiResponse = ApiClients.geminiService.generateContent(
-            model = "gemini-3.5-flash",
+            model = modelToUse,
             apiKey = resolvedKey,
             request = request
         )
 
         apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
             ?: throw Exception("Empty response from Gemini API.")
-    }
-
-    private suspend fun callOfflineAI(prompt: String, history: List<Map<String, String>>): String = withContext(Dispatchers.IO) {
-        val autoFallback = !_isOfflineMode.value && !_isInternetAvailable.value
-        if (autoFallback) {
-            repository.addLog("AI_Call", "Internet is unavailable! Automatically routing to local llama.cpp backend.")
-        } else {
-            repository.addLog("AI_Call", "Calling local AI Flask backend (Power-Save Active: ${_isPowerSaveActive.value})...")
-        }
-
-        // Gather relevant memory context to enrich the conversation prompt using hybrid semantic vector search!
-        val maxMemories = if (_isPowerSaveActive.value) 1 else 5
-        val semanticResults = retrieveSemanticMemories(prompt, limit = maxMemories)
-        val memoryContext = if (semanticResults.isNotEmpty()) {
-            "Relevant user memories to remember:\n" + semanticResults.joinToString("\n") { "- ${it.first.content}" } + "\n\n"
-        } else ""
-
-        val enrichedPrompt = if (memoryContext.isNotEmpty()) {
-            "$memoryContext\nUser prompt: $prompt"
-        } else prompt
-
-        // Let's attempt to contact local flask backend first
-        try {
-            val maxHistory = if (_isPowerSaveActive.value) 3 else 10
-            val request = ChatRequest(
-                message = enrichedPrompt,
-                history = history.takeLast(maxHistory)
-            )
-            val response = ApiClients.getBackendService(_backendUrl.value).chat(request)
-            _backendHealth.value = true
-            return@withContext response.response
-        } catch (backendException: Exception) {
-            repository.addLog("AI_Call", "Backend failed or unreachable. Trying direct llama.cpp completed API...")
-            // If Flask fails, try direct completion on llama.cpp HTTP server
-            try {
-                val queryPrompt = "User: $enrichedPrompt\nAssistant:"
-                // Restrict predict/generation length in Power-Save mode to save local device CPU
-                val maxPredict = if (_isPowerSaveActive.value) 64 else 128
-                val request = LlamaCompletionRequest(prompt = queryPrompt, nPredict = maxPredict)
-                val response = ApiClients.getLlamaDirectService(_llamaUrl.value).complete(request)
-                _backendHealth.value = true
-                return@withContext response.content
-            } catch (llamaException: Exception) {
-                // If both fail, log details and fallback to an intelligent simulated offline response
-                _backendHealth.value = false
-                repository.addLog("AI_Call", "Offline AI server could not be reached.")
-
-                val reasonPrefix = if (autoFallback) {
-                    "I noticed your internet connection is unavailable, so I automatically attempted to route your message to Baby's private local offline AI (llama.cpp / Flask server).\n\n"
-                } else {
-                    "I am in Offline Mode, but I cannot connect to Baby's local AI Server.\n\n"
-                }
-
-                return@withContext reasonPrefix +
-                        "**Troubleshooting Checklist:**\n" +
-                        "1. Ensure llama.cpp or Flask server is running on your machine.\n" +
-                        "2. Ensure your phone or emulator can access `${_backendUrl.value}` (use `10.0.2.2` in emulator to point to your PC's localhost).\n" +
-                        "3. Start Flask api_server.py or run `llama-server -m models/tinyllama.gguf -c 512`.\n\n" +
-                        "*Simulated fallback assistant response:* Hello there! I'm here to assist you. Once you connect your local llama.cpp server, I will possess fully private, offline intelligence!"
-            }
-        }
     }
 
     // --- Vector & Semantic Database Helpers ---
@@ -929,21 +824,6 @@ class BabyViewModel(
         }
     }
 
-    // --- Health Check ---
-
-    fun checkBackendHealth() {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val health = ApiClients.getBackendService(_backendUrl.value).checkHealth()
-                _backendHealth.value = health.llamaCppConnected || health.status == "healthy"
-                repository.addLog("System", "Backend health status: Status=${health.status}, llama.cpp=${health.llamaCppConnected}")
-            } catch (e: Exception) {
-                _backendHealth.value = false
-                repository.addLog("System", "Backend unreachable at ${_backendUrl.value}")
-            }
-        }
-    }
-
     // --- Speech Control Methods ---
 
     fun startListening() {
@@ -975,28 +855,8 @@ class BabyViewModel(
         viewModelScope.launch {
             repository.saveSetting(key, value)
             when (key) {
-                "is_auto_switch_enabled" -> {
-                    _isAutoSwitchEnabled.value = value.toBoolean()
-                    if (value.toBoolean()) {
-                        val targetOfflineMode = !_isInternetAvailable.value
-                        if (_isOfflineMode.value != targetOfflineMode) {
-                            _isOfflineMode.value = targetOfflineMode
-                            repository.saveSetting("is_offline_mode", targetOfflineMode.toString())
-                            repository.addLog(
-                                "Network_AutoSwitch",
-                                "Auto-switch enabled: Switched AI core to ${if (targetOfflineMode) "Local Llama.cpp (Offline)" else "Gemini Cloud (Online)"}"
-                            )
-                        }
-                    }
-                }
-                "is_offline_mode" -> _isOfflineMode.value = value.toBoolean()
-                "selected_provider" -> _selectedProvider.value = value
                 "api_key" -> _apiKey.value = value
-                "backend_url" -> {
-                    _backendUrl.value = value
-                    checkBackendHealth()
-                }
-                "llama_url" -> _llamaUrl.value = value
+                "gemini_model" -> _geminiModel.value = value
                 "voice_pitch" -> {
                     val pitchVal = value.toFloatOrNull() ?: 1.0f
                     _voicePitch.value = pitchVal
@@ -1080,29 +940,7 @@ class BabyViewModel(
             
             // Adjust background tasks / voice manager
             voiceManager?.isPowerSaveMode = active
-            
-            // Adjust health check frequency if needed
-            resetHealthCheckTimer()
         }
-    }
-
-    private fun startHealthCheckTimer() {
-        healthCheckJob?.cancel()
-        healthCheckJob = viewModelScope.launch {
-            while (isActive) {
-                checkBackendHealth()
-                val delayMs = if (_isPowerSaveActive.value) {
-                    120000L // 2 minutes in power-save mode
-                } else {
-                    30000L // 30 seconds in normal mode
-                }
-                delay(delayMs)
-            }
-        }
-    }
-
-    private fun resetHealthCheckTimer() {
-        startHealthCheckTimer()
     }
 
     fun addManualMemory(content: String, type: String, importance: Int) {
@@ -1368,7 +1206,6 @@ class BabyViewModel(
         } catch (e: Exception) {
             Log.e("BabyViewModel", "Failed to unregister battery receiver", e)
         }
-        healthCheckJob?.cancel()
         voiceManager?.destroy()
     }
 }
@@ -1381,12 +1218,12 @@ suspend fun callOnlineAIWrapper(
 ): String = withContext(Dispatchers.IO) {
     val resolvedKey = apiKey.ifEmpty { BuildConfig.GEMINI_API_KEY }
     if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
-        throw IllegalStateException("API Key is missing.")
+        return@withContext "Please enter your Gemini API Key in Settings to enable AI responses."
     }
 
     repository?.addLog("AI_Call", "Calling Gemini API in background service...")
 
-    val systemInstructionText = "You are Baby, a natural, emotionally intelligent offline-first AI assistant for Android. Keep your answers concise, engaging, and friendly."
+    val systemInstructionText = "You are Baby, a natural, emotionally intelligent AI assistant for Android. Keep your answers concise, engaging, and friendly."
     val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
 
     val contents = mutableListOf<GeminiContent>()
@@ -1410,43 +1247,15 @@ suspend fun callOnlineAIWrapper(
         systemInstruction = systemInstruction
     )
 
+    val modelToUse = repository?.getSetting("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
+
     val apiResponse = ApiClients.geminiService.generateContent(
-        model = "gemini-3.5-flash",
+        model = modelToUse,
         apiKey = resolvedKey,
         request = request
     )
 
     apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
         ?: throw Exception("Empty response from Gemini API.")
-}
-
-suspend fun callOfflineAIWrapper(
-    prompt: String,
-    history: List<Map<String, String>>,
-    repository: BabyRepository?
-): String = withContext(Dispatchers.IO) {
-    val backendUrl = repository?.getSetting("backend_url", "http://10.0.2.2:5000/") ?: "http://10.0.2.2:5000/"
-    val llamaUrl = repository?.getSetting("llama_url", "http://10.0.2.2:8080/") ?: "http://10.0.2.2:8080/"
-
-    repository?.addLog("AI_Call", "Calling local AI Flask backend in background service...")
-
-    try {
-        val request = ChatRequest(
-            message = prompt,
-            history = history.takeLast(5)
-        )
-        val response = ApiClients.getBackendService(backendUrl).chat(request)
-        return@withContext response.response
-    } catch (backendException: Exception) {
-        try {
-            val queryPrompt = "User: $prompt\nAssistant:"
-            val request = LlamaCompletionRequest(prompt = queryPrompt, nPredict = 64)
-            val response = ApiClients.getLlamaDirectService(llamaUrl).complete(request)
-            return@withContext response.content
-        } catch (llamaException: Exception) {
-            repository?.addLog("AI_Call", "Offline AI server could not be reached in background.")
-            return@withContext "I am running offline in the background, but my local AI server is currently unreachable. How else can I help you control your device?"
-        }
-    }
 }
 

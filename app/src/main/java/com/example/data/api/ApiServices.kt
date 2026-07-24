@@ -61,62 +61,6 @@ data class GeminiEmbeddingValue(
     @Json(name = "values") val values: List<Float>? = null
 )
 
-// --- Local Backend (Flask) & llama.cpp Models ---
-
-@JsonClass(generateAdapter = true)
-data class ChatRequest(
-    @Json(name = "message") val message: String,
-    @Json(name = "history") val history: List<Map<String, String>>? = null
-)
-
-@JsonClass(generateAdapter = true)
-data class ChatResponse(
-    @Json(name = "response") val response: String
-)
-
-@JsonClass(generateAdapter = true)
-data class VoiceRequest(
-    @Json(name = "audio_base64") val audioBase64: String
-)
-
-@JsonClass(generateAdapter = true)
-data class VoiceResponse(
-    @Json(name = "text") val text: String,
-    @Json(name = "response") val response: String
-)
-
-@JsonClass(generateAdapter = true)
-data class MemorySaveRequest(
-    @Json(name = "content") val content: String,
-    @Json(name = "type") val type: String
-)
-
-@JsonClass(generateAdapter = true)
-data class BackendMemoryItem(
-    @Json(name = "id") val id: Int,
-    @Json(name = "content") val content: String,
-    @Json(name = "type") val type: String,
-    @Json(name = "timestamp") val timestamp: String
-)
-
-@JsonClass(generateAdapter = true)
-data class HealthResponse(
-    @Json(name = "status") val status: String,
-    @Json(name = "llama_cpp_connected") val llamaCppConnected: Boolean
-)
-
-@JsonClass(generateAdapter = true)
-data class LlamaCompletionRequest(
-    @Json(name = "prompt") val prompt: String,
-    @Json(name = "n_predict") val nPredict: Int = 128,
-    @Json(name = "temperature") val temperature: Float = 0.7f
-)
-
-@JsonClass(generateAdapter = true)
-data class LlamaCompletionResponse(
-    @Json(name = "content") val content: String
-)
-
 // --- Retrofit Interfaces ---
 
 interface GeminiApiService {
@@ -135,31 +79,6 @@ interface GeminiApiService {
     ): GeminiEmbeddingResponse
 }
 
-interface BabyBackendApiService {
-    @POST("chat")
-    suspend fun chat(@Body request: ChatRequest): ChatResponse
-
-    @POST("voice")
-    suspend fun voice(@Body request: VoiceRequest): VoiceResponse
-
-    @POST("memory/save")
-    suspend fun saveMemory(@Body request: MemorySaveRequest): Map<String, String>
-
-    @GET("memory")
-    suspend fun getMemories(): List<BackendMemoryItem>
-
-    @DELETE("memory/{id}")
-    suspend fun deleteMemory(@Path("id") id: Int): Map<String, String>
-
-    @GET("health")
-    suspend fun checkHealth(): HealthResponse
-}
-
-interface LlamaDirectApiService {
-    @POST("completion")
-    suspend fun complete(@Body request: LlamaCompletionRequest): LlamaCompletionResponse
-}
-
 object ApiClients {
     private const val GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/"
 
@@ -176,25 +95,5 @@ object ApiClients {
             .addConverterFactory(MoshiConverterFactory.create())
             .build()
             .create(GeminiApiService::class.java)
-    }
-
-    fun getBackendService(baseUrl: String): BabyBackendApiService {
-        val sanitizedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
-        return Retrofit.Builder()
-            .baseUrl(sanitizedUrl)
-            .client(okHttpClient)
-            .addConverterFactory(MoshiConverterFactory.create())
-            .build()
-            .create(BabyBackendApiService::class.java)
-    }
-
-    fun getLlamaDirectService(baseUrl: String): LlamaDirectApiService {
-        val sanitizedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
-        return Retrofit.Builder()
-            .baseUrl(sanitizedUrl)
-            .client(okHttpClient)
-            .addConverterFactory(MoshiConverterFactory.create())
-            .build()
-            .create(LlamaDirectApiService::class.java)
     }
 }
