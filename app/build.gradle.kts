@@ -32,10 +32,33 @@ android {
       keyPassword = System.getenv("KEY_PASSWORD")
     }
     create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+      val debugKsFile = file("${rootDir}/debug.keystore")
+      if (!debugKsFile.exists()) {
+        try {
+          ProcessBuilder(
+            "keytool", "-genkey", "-v",
+            "-keystore", debugKsFile.absolutePath,
+            "-storepass", "android",
+            "-alias", "androiddebugkey",
+            "-keypass", "android",
+            "-keyalg", "RSA",
+            "-keysize", "2048",
+            "-validity", "10000",
+            "-dname", "CN=Android Debug,O=Android,C=US"
+          ).start().waitFor()
+        } catch (_: Exception) {}
+      }
+      if (debugKsFile.exists()) {
+        storeFile = debugKsFile
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      } else {
+        storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
   }
 
@@ -47,7 +70,11 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      signingConfig = signingConfigs.getByName("debugConfig")
+      signingConfig = if (signingConfigs.getByName("debugConfig").storeFile?.exists() == true) {
+        signingConfigs.getByName("debugConfig")
+      } else {
+        signingConfigs.getByName("debug")
+      }
     }
   }
   compileOptions {
