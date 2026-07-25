@@ -28,6 +28,8 @@ import com.example.MainActivity
 import com.example.R
 import com.example.data.NetworkMonitor
 import com.example.data.local.DeviceControlManager
+import com.example.data.local.CommandRoutingEngine
+import com.example.data.local.RoutingResult
 import com.example.data.local.db.AppDatabase
 import com.example.data.repository.BabyRepository
 import com.example.ui.viewmodel.AssistantState
@@ -56,6 +58,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var repository: BabyRepository? = null
     private var deviceControlManager: DeviceControlManager? = null
+    private var routingEngine: CommandRoutingEngine? = null
     private var networkMonitor: NetworkMonitor? = null
 
     // Setting values
@@ -74,7 +77,9 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     override fun onCreate() {
         super.onCreate()
         Log.d(tag, "Service onCreate")
-        deviceControlManager = DeviceControlManager(this)
+        val dcm = DeviceControlManager(this)
+        deviceControlManager = dcm
+        routingEngine = CommandRoutingEngine(dcm)
         
         val db = AppDatabase.getDatabase(applicationContext)
         repository = BabyRepository(
@@ -330,11 +335,13 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         // Save command into database
         repository?.addMessage(activeConvId, "user", commandText)
 
-        // 1. Analyze if it is a local device command
-        val matchResult = executeLocalDeviceControl(commandText)
-        if (matchResult != null) {
-            repository?.addMessage(activeConvId, "assistant", matchResult)
-            speak(matchResult)
+        // 1. Route intent using CommandRoutingEngine
+        val routeResult = routingEngine?.routeAndExecute(commandText) ?: RoutingResult.SendToGemini
+
+        if (routeResult is RoutingResult.LocalCommand) {
+            val response = routeResult.responseText
+            repository?.addMessage(activeConvId, "assistant", response)
+            speak(response)
             
             isProcessingCommand = false
             if (isContinuousConversation) {
@@ -358,9 +365,9 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             repository?.addMessage(activeConvId, "assistant", aiResponse)
             speak(aiResponse)
         } catch (e: Exception) {
-            val errMsg = "Error processing: ${e.localizedMessage}"
+            val errMsg = "Sorry, I had an error processing that: ${e.localizedMessage}"
             repository?.addMessage(activeConvId, "assistant", errMsg)
-            speak("Sorry, I had an error processing that.")
+            speak("Sorry, I couldn't complete that request.")
         } finally {
             updateNotificationText("BabyAI Background Assistant active")
             isProcessingCommand = false
@@ -374,162 +381,14 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Matches speech text with specific Device Controls
+    // Matches speech text with specific Device Controls via CommandRoutingEngine
     private fun executeLocalDeviceControl(text: String): String? {
-        val manager = deviceControlManager ?: return null
-        val lowerText = text.lowercase(Locale.ROOT)
-
-        // Flashlight
-        if (lowerText.contains("turn on flashlight") || lowerText.contains("turn on torch") || lowerText.contains("flashlight on") || lowerText.contains("torch on")) {
-            return manager.setFlashlight(true)
+        val result = routingEngine?.routeAndExecute(text)
+        return if (result is RoutingResult.LocalCommand) {
+            result.responseText
+        } else {
+            null
         }
-        if (lowerText.contains("turn off flashlight") || lowerText.contains("turn off torch") || lowerText.contains("flashlight off") || lowerText.contains("torch off")) {
-            return manager.setFlashlight(false)
-        }
-
-        // Launch Apps
-        if (lowerText.startsWith("open ") || lowerText.startsWith("launch ")) {
-            val appName = text.substringAfter("open").substringAfter("launch").trim()
-            return manager.launchApp(appName)
-        }
-
-        // Music
-        if (lowerText.contains("play music") || lowerText.contains("resume music")) {
-            return manager.controlMusic("play")
-        }
-        if (lowerText.contains("pause music") || lowerText.contains("stop music")) {
-            return manager.controlMusic("pause")
-        }
-        if (lowerText.contains("next song") || lowerText.contains("next track")) {
-            return manager.controlMusic("next")
-        }
-        if (lowerText.contains("previous song") || lowerText.contains("previous track")) {
-            return manager.controlMusic("previous")
-        }
-        if (lowerText.contains("volume up") || lowerText.contains("louder")) {
-            return manager.controlMusic("volume_up")
-        }
-        if (lowerText.contains("volume down") || lowerText.contains("quieter")) {
-            return manager.controlMusic("volume_down")
-        }
-
-        // Navigation
-        if (lowerText.startsWith("navigate to ") || lowerText.startsWith("directions to ")) {
-            val dest = text.substringAfter("navigate to").substringAfter("directions to").trim()
-            return manager.openMaps(dest)
-        }
-        if (lowerText.contains("navigate home")) {
-            return manager.openMaps("Home")
-        }
-        if (lowerText.contains("navigate to work")) {
-            return manager.openMaps("Work")
-        }
-        if (lowerText.contains("search nearby restaurants") || lowerText.contains("restaurants nearby")) {
-            return manager.openMaps("restaurants")
-        }
-
-        // Device states
-        if (lowerText.contains("turn bluetooth on") || lowerText.contains("bluetooth on")) {
-            return manager.setBluetoothState(true)
-        }
-        if (lowerText.contains("turn bluetooth off") || lowerText.contains("bluetooth off")) {
-            return manager.setBluetoothState(false)
-        }
-        if (lowerText.contains("turn wifi on") || lowerText.contains("wifi on")) {
-            return manager.setWifiState(true)
-        }
-        if (lowerText.contains("turn wifi off") || lowerText.contains("wifi off")) {
-            return manager.setWifiState(false)
-        }
-        if (lowerText.contains("enable do not disturb") || lowerText.contains("turn dnd on") || lowerText.contains("dnd on")) {
-            return manager.setDNDMode(true)
-        }
-        if (lowerText.contains("disable do not disturb") || lowerText.contains("turn dnd off") || lowerText.contains("dnd off")) {
-            return manager.setDNDMode(false)
-        }
-
-        // Brightness
-        if (lowerText.contains("brightness to ")) {
-            val raw = lowerText.substringAfter("brightness to").trim().removeSuffix("%").trim()
-            val parsed = raw.toFloatOrNull()
-            if (parsed != null) {
-                val value = (parsed / 100f).coerceIn(0f, 1f)
-                return manager.setBrightness(value)
-            }
-        }
-
-        // Web Search / Browser
-        if (lowerText.startsWith("search google for ") || lowerText.startsWith("search for ")) {
-            val q = text.substringAfter("search google for").substringAfter("search for").trim()
-            return manager.searchWeb(q, "google")
-        }
-        if (lowerText.startsWith("search youtube for ")) {
-            val q = text.substringAfter("search youtube for").trim()
-            return manager.searchWeb(q, "youtube")
-        }
-        if (lowerText.startsWith("search wikipedia for ")) {
-            val q = text.substringAfter("search wikipedia for").trim()
-            return manager.searchWeb(q, "wikipedia")
-        }
-        if (lowerText.startsWith("open website ")) {
-            val site = text.substringAfter("open website").trim()
-            return manager.openWebsite(site)
-        }
-
-        // Settings Shortcuts
-        if (lowerText.contains("open wifi settings")) return manager.openSettingsScreen("wifi")
-        if (lowerText.contains("open bluetooth settings")) return manager.openSettingsScreen("bluetooth")
-        if (lowerText.contains("open battery settings")) return manager.openSettingsScreen("battery")
-        if (lowerText.contains("open developer settings") || lowerText.contains("open developer options")) return manager.openSettingsScreen("developer")
-        if (lowerText.contains("open accessibility settings")) return manager.openSettingsScreen("accessibility")
-        if (lowerText.contains("open application settings")) return manager.openSettingsScreen("applications")
-
-        // Clipboard
-        if (lowerText.contains("read clipboard") || lowerText.contains("what is in my clipboard")) {
-            return "In your clipboard: " + manager.readClipboard()
-        }
-
-        // Contacts / Calls
-        if (lowerText.startsWith("call ")) {
-            val contactName = text.substringAfter("call").trim()
-            val contacts = manager.searchContacts(contactName)
-            return if (contacts.isNotEmpty()) {
-                val contact = contacts[0]
-                manager.makeCall(contact.phoneNumber)
-                "Placing call to ${contact.name} at ${contact.phoneNumber}."
-            } else {
-                "No contact found matching '$contactName'."
-            }
-        }
-        if (lowerText.contains("search contact ") || lowerText.contains("find contact ")) {
-            val q = text.substringAfter("search contact").substringAfter("find contact").trim()
-            val list = manager.searchContacts(q)
-            return if (list.isNotEmpty()) {
-                "Found contacts:\n" + list.joinToString("\n") { "- ${it.name}: ${it.phoneNumber}" }
-            } else {
-                "No contacts found matching '$q'."
-            }
-        }
-
-        // SMS
-        if (lowerText.startsWith("send sms to ") || lowerText.startsWith("text ")) {
-            val parts = text.substringAfter("send sms to").substringAfter("text").trim().split(" ", limit = 2)
-            if (parts.size >= 2) {
-                val contactName = parts[0]
-                val msg = parts[1]
-                val contacts = manager.searchContacts(contactName)
-                if (contacts.isNotEmpty()) {
-                    val phone = contacts[0].phoneNumber
-                    return manager.sendSMS(phone, msg)
-                }
-            }
-        }
-
-        // Camera
-        if (lowerText.contains("open camera")) return manager.openSystemCamera(false)
-        if (lowerText.contains("record video")) return manager.openSystemCamera(true)
-
-        return null
     }
 
     private fun speak(text: String) {

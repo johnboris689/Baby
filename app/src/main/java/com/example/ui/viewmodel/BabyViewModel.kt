@@ -22,6 +22,8 @@ import com.example.data.local.entity.TaskEntity
 import com.example.data.local.entity.AutomationRuleEntity
 import com.example.data.repository.BabyRepository
 import com.example.data.local.DeviceControlManager
+import com.example.data.local.CommandRoutingEngine
+import com.example.data.local.RoutingResult
 import com.example.ui.voice.VoiceManager
 import com.example.data.NetworkMonitor
 import android.content.BroadcastReceiver
@@ -85,6 +87,7 @@ class BabyViewModel(
 
     // --- Configuration State ---
     private val deviceControlManager = DeviceControlManager(application)
+    private val routingEngine = CommandRoutingEngine(deviceControlManager)
     private val networkMonitor = NetworkMonitor(application)
     private val _isInternetAvailable = MutableStateFlow(true)
     val isInternetAvailable: StateFlow<Boolean> = _isInternetAvailable.asStateFlow()
@@ -92,7 +95,7 @@ class BabyViewModel(
     private val _apiKey = MutableStateFlow("")
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
-    private val _geminiModel = MutableStateFlow("gemini-2.5-flash")
+    private val _geminiModel = MutableStateFlow("gemini-3.5-flash")
     val geminiModel: StateFlow<String> = _geminiModel.asStateFlow()
 
     private val _voicePitch = MutableStateFlow(1.0f)
@@ -225,7 +228,7 @@ class BabyViewModel(
         // Load initial settings from DB
         viewModelScope.launch {
             _apiKey.value = repository.getSetting("api_key", "")
-            _geminiModel.value = repository.getSetting("gemini_model", "gemini-2.5-flash")
+            _geminiModel.value = repository.getSetting("gemini_model", "gemini-3.5-flash")
             _voicePitch.value = repository.getSetting("voice_pitch", "1.0").toFloatOrNull() ?: 1.0f
             _voiceRate.value = repository.getSetting("voice_rate", "1.0").toFloatOrNull() ?: 1.0f
             _voiceStyle.value = repository.getSetting("voice_style", "default")
@@ -678,7 +681,7 @@ class BabyViewModel(
             generationConfig = generationConfig
         )
 
-        val modelToUse = _geminiModel.value.ifEmpty { "gemini-2.5-flash" }
+        val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.5-flash" }
 
         val apiResponse = ApiClients.geminiService.generateContent(
             model = modelToUse,
@@ -807,7 +810,7 @@ class BabyViewModel(
                 )
 
                 val response = ApiClients.geminiService.generateContent(
-                    model = "gemini-2.5-flash",
+                    model = "gemini-3.5-flash",
                     apiKey = resolvedKey,
                     request = request
                 )
@@ -1034,169 +1037,12 @@ class BabyViewModel(
     }
 
     fun executeLocalDeviceControl(text: String): String? {
-        val lowerText = text.lowercase(java.util.Locale.ROOT)
-
-        // Flashlight
-        if (_flashlightControlEnabled.value) {
-            if (lowerText.contains("turn on flashlight") || lowerText.contains("turn on torch") || lowerText.contains("flashlight on") || lowerText.contains("torch on")) {
-                return deviceControlManager.setFlashlight(true)
-            }
-            if (lowerText.contains("turn off flashlight") || lowerText.contains("turn off torch") || lowerText.contains("flashlight off") || lowerText.contains("torch off")) {
-                return deviceControlManager.setFlashlight(false)
-            }
+        val result = routingEngine.routeAndExecute(text)
+        return if (result is RoutingResult.LocalCommand) {
+            result.responseText
+        } else {
+            null
         }
-
-        // Launch Apps
-        if (_appLaunchingEnabled.value) {
-            if (lowerText.startsWith("open ") || lowerText.startsWith("launch ")) {
-                val appName = text.substringAfter("open").substringAfter("launch").trim()
-                return deviceControlManager.launchApp(appName)
-            }
-        }
-
-        // Music
-        if (lowerText.contains("play music") || lowerText.contains("resume music")) {
-            return deviceControlManager.controlMusic("play")
-        }
-        if (lowerText.contains("pause music") || lowerText.contains("stop music")) {
-            return deviceControlManager.controlMusic("pause")
-        }
-        if (lowerText.contains("next song") || lowerText.contains("next track")) {
-            return deviceControlManager.controlMusic("next")
-        }
-        if (lowerText.contains("previous song") || lowerText.contains("previous track")) {
-            return deviceControlManager.controlMusic("previous")
-        }
-        if (lowerText.contains("volume up") || lowerText.contains("louder")) {
-            return deviceControlManager.controlMusic("volume_up")
-        }
-        if (lowerText.contains("volume down") || lowerText.contains("quieter")) {
-            return deviceControlManager.controlMusic("volume_down")
-        }
-
-        // Navigation
-        if (lowerText.startsWith("navigate to ") || lowerText.startsWith("directions to ")) {
-            val dest = text.substringAfter("navigate to").substringAfter("directions to").trim()
-            return deviceControlManager.openMaps(dest)
-        }
-        if (lowerText.contains("navigate home")) {
-            return deviceControlManager.openMaps("Home")
-        }
-        if (lowerText.contains("navigate to work")) {
-            return deviceControlManager.openMaps("Work")
-        }
-        if (lowerText.contains("search nearby restaurants") || lowerText.contains("restaurants nearby")) {
-            return deviceControlManager.openMaps("restaurants")
-        }
-
-        // Device states (Bluetooth, Wifi, DND)
-        if (lowerText.contains("turn bluetooth on") || lowerText.contains("bluetooth on")) {
-            return deviceControlManager.setBluetoothState(true)
-        }
-        if (lowerText.contains("turn bluetooth off") || lowerText.contains("bluetooth off")) {
-            return deviceControlManager.setBluetoothState(false)
-        }
-        if (lowerText.contains("turn wifi on") || lowerText.contains("wifi on")) {
-            return deviceControlManager.setWifiState(true)
-        }
-        if (lowerText.contains("turn wifi off") || lowerText.contains("wifi off")) {
-            return deviceControlManager.setWifiState(false)
-        }
-        if (lowerText.contains("enable do not disturb") || lowerText.contains("turn dnd on") || lowerText.contains("dnd on")) {
-            return deviceControlManager.setDNDMode(true)
-        }
-        if (lowerText.contains("disable do not disturb") || lowerText.contains("turn dnd off") || lowerText.contains("dnd off")) {
-            return deviceControlManager.setDNDMode(false)
-        }
-
-        // Brightness
-        if (lowerText.contains("brightness to ")) {
-            val raw = lowerText.substringAfter("brightness to").trim().removeSuffix("%").trim()
-            val parsed = raw.toFloatOrNull()
-            if (parsed != null) {
-                val value = (parsed / 100f).coerceIn(0f, 1f)
-                return deviceControlManager.setBrightness(value)
-            }
-        }
-
-        // Web Search
-        if (lowerText.startsWith("search google for ") || lowerText.startsWith("search for ")) {
-            val q = text.substringAfter("search google for").substringAfter("search for").trim()
-            return deviceControlManager.searchWeb(q, "google")
-        }
-        if (lowerText.startsWith("search youtube for ")) {
-            val q = text.substringAfter("search youtube for").trim()
-            return deviceControlManager.searchWeb(q, "youtube")
-        }
-        if (lowerText.startsWith("search wikipedia for ")) {
-            val q = text.substringAfter("search wikipedia for").trim()
-            return deviceControlManager.searchWeb(q, "wikipedia")
-        }
-        if (lowerText.startsWith("open website ")) {
-            val site = text.substringAfter("open website").trim()
-            return deviceControlManager.openWebsite(site)
-        }
-
-        // Settings Shortcuts
-        if (lowerText.contains("open wifi settings")) return deviceControlManager.openSettingsScreen("wifi")
-        if (lowerText.contains("open bluetooth settings")) return deviceControlManager.openSettingsScreen("bluetooth")
-        if (lowerText.contains("open battery settings")) return deviceControlManager.openSettingsScreen("battery")
-        if (lowerText.contains("open developer settings") || lowerText.contains("open developer options")) return deviceControlManager.openSettingsScreen("developer")
-        if (lowerText.contains("open accessibility settings")) return deviceControlManager.openSettingsScreen("accessibility")
-        if (lowerText.contains("open application settings")) return deviceControlManager.openSettingsScreen("applications")
-
-        // Clipboard
-        if (lowerText.contains("read clipboard") || lowerText.contains("what is in my clipboard")) {
-            return "In your clipboard: " + deviceControlManager.readClipboard()
-        }
-
-        // Contacts / Calls
-        if (_contactAccessEnabled.value) {
-            if (lowerText.startsWith("call ")) {
-                val contactName = text.substringAfter("call").trim()
-                val contacts = deviceControlManager.searchContacts(contactName)
-                return if (contacts.isNotEmpty()) {
-                    val contact = contacts[0]
-                    deviceControlManager.makeCall(contact.phoneNumber)
-                    "Placing call to ${contact.name} at ${contact.phoneNumber}."
-                } else {
-                    "No contact found matching '$contactName'."
-                }
-            }
-            if (lowerText.contains("search contact ") || lowerText.contains("find contact ")) {
-                val q = text.substringAfter("search contact").substringAfter("find contact").trim()
-                val list = deviceControlManager.searchContacts(q)
-                return if (list.isNotEmpty()) {
-                    "Found contacts:\n" + list.joinToString("\n") { "- ${it.name}: ${it.phoneNumber}" }
-                } else {
-                    "No contacts found matching '$q'."
-                }
-            }
-        }
-
-        // SMS
-        if (_smsAccessEnabled.value) {
-            if (lowerText.startsWith("send sms to ") || lowerText.startsWith("text ")) {
-                val parts = text.substringAfter("send sms to").substringAfter("text").trim().split(" ", limit = 2)
-                if (parts.size >= 2) {
-                    val contactName = parts[0]
-                    val msg = parts[1]
-                    val contacts = deviceControlManager.searchContacts(contactName)
-                    if (contacts.isNotEmpty()) {
-                        val phone = contacts[0].phoneNumber
-                        return deviceControlManager.sendSMS(phone, msg)
-                    }
-                }
-            }
-        }
-
-        // Camera
-        if (_cameraAccessEnabled.value) {
-            if (lowerText.contains("open camera")) return deviceControlManager.openSystemCamera(false)
-            if (lowerText.contains("record video")) return deviceControlManager.openSystemCamera(true)
-        }
-
-        return null
     }
 
     override fun onCleared() {
@@ -1247,7 +1093,7 @@ suspend fun callOnlineAIWrapper(
         systemInstruction = systemInstruction
     )
 
-    val modelToUse = repository?.getSetting("gemini_model", "gemini-2.5-flash") ?: "gemini-2.5-flash"
+    val modelToUse = repository?.getSetting("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
 
     val apiResponse = ApiClients.geminiService.generateContent(
         model = modelToUse,
