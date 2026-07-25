@@ -358,7 +358,14 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         updateNotificationText("BabyAI: Thinking...")
         try {
             val apiKey = repository?.getSetting("api_key", "") ?: ""
-            val messagesHistory = listOf(mapOf("role" to "user", "content" to commandText))
+            val lastMessages = repository?.getMessages(activeConvId)?.firstOrNull()?.takeLast(6) ?: emptyList()
+            val messagesHistory = if (lastMessages.isNotEmpty()) {
+                lastMessages.map {
+                    mapOf("role" to it.role, "content" to it.content)
+                }
+            } else {
+                listOf(mapOf("role" to "user", "content" to commandText))
+            }
             
             val aiResponse = callOnlineAIWrapper(commandText, messagesHistory, apiKey, repository)
 

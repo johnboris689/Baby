@@ -12,6 +12,7 @@ import com.example.data.api.ApiClients
 import com.example.data.api.GeminiContent
 import com.example.data.api.GeminiPart
 import com.example.data.api.GeminiRequest
+import com.example.data.api.GeminiResponse
 import com.example.data.api.GeminiGenerationConfig
 import com.example.data.local.entity.ConversationEntity
 import com.example.data.local.entity.LogEntity
@@ -683,7 +684,7 @@ class BabyViewModel(
 
         val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.5-flash" }
 
-        val apiResponse = ApiClients.geminiService.generateContent(
+        val apiResponse = callGeminiWithExponentialBackoff(
             model = modelToUse,
             apiKey = resolvedKey,
             request = request
@@ -1095,7 +1096,7 @@ suspend fun callOnlineAIWrapper(
 
     val modelToUse = repository?.getSetting("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
 
-    val apiResponse = ApiClients.geminiService.generateContent(
+    val apiResponse = callGeminiWithExponentialBackoff(
         model = modelToUse,
         apiKey = resolvedKey,
         request = request
@@ -1103,5 +1104,40 @@ suspend fun callOnlineAIWrapper(
 
     apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
         ?: throw Exception("Empty response from Gemini API.")
+}
+
+suspend fun callGeminiWithExponentialBackoff(
+    model: String,
+    apiKey: String,
+    request: GeminiRequest,
+    maxRetries: Int = 3
+): GeminiResponse = withContext(Dispatchers.IO) {
+    var delayMs = 1000L
+    for (attempt in 0 until maxRetries) {
+        try {
+            return@withContext ApiClients.geminiService.generateContent(
+                model = model,
+                apiKey = apiKey,
+                request = request
+            )
+        } catch (e: retrofit2.HttpException) {
+            if ((e.code() == 429 || e.code() >= 500) && attempt < maxRetries - 1) {
+                Log.w("GeminiAPI", "HTTP ${e.code()} error. Retrying attempt ${attempt + 1} in ${delayMs}ms...")
+                delay(delayMs)
+                delayMs *= 2
+            } else {
+                throw e
+            }
+        } catch (e: Exception) {
+            if (attempt < maxRetries - 1) {
+                Log.w("GeminiAPI", "Network exception ${e.message}. Retrying attempt ${attempt + 1} in ${delayMs}ms...")
+                delay(delayMs)
+                delayMs *= 2
+            } else {
+                throw e
+            }
+        }
+    }
+    throw Exception("Gemini API call failed after $maxRetries attempts.")
 }
 

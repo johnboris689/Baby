@@ -1,6 +1,7 @@
 package com.example.data.local
 
 import android.Manifest
+import android.app.ActivityManager
 import android.app.NotificationManager
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
@@ -8,15 +9,18 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.database.Cursor
-import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
+import android.os.StatFs
+import android.provider.AlarmClock
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.provider.Settings
@@ -27,9 +31,50 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import java.util.Locale
 
+data class AppInfo(val label: String, val packageName: String)
+
 class DeviceControlManager(private val context: Context) {
 
     private val tag = "DeviceControlManager"
+
+    companion object {
+        val COMMON_ALIASES = mapOf(
+            "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+            "google play" to listOf("com.android.vending"),
+            "play store" to listOf("com.android.vending"),
+            "store" to listOf("com.android.vending"),
+            "chrome" to listOf("com.android.chrome"),
+            "browser" to listOf("com.android.chrome", "org.mozilla.firefox"),
+            "youtube" to listOf("com.google.android.youtube"),
+            "settings" to listOf("com.android.settings"),
+            "calculator" to listOf("com.google.android.calculator", "com.sec.android.app.popupcalculator", "com.android.calculator2"),
+            "calc" to listOf("com.google.android.calculator", "com.sec.android.app.popupcalculator", "com.android.calculator2"),
+            "phone" to listOf("com.google.android.dialer", "com.samsung.android.dialer", "com.android.dialer"),
+            "dialer" to listOf("com.google.android.dialer", "com.samsung.android.dialer", "com.android.dialer"),
+            "gallery" to listOf("com.google.android.apps.photos", "com.sec.android.gallery3d"),
+            "photos" to listOf("com.google.android.apps.photos"),
+            "camera" to listOf("com.google.android.GoogleCamera", "com.sec.android.app.camera", "com.android.camera2", "com.android.camera"),
+            "contacts" to listOf("com.google.android.contacts", "com.samsung.android.app.contacts"),
+            "files" to listOf("com.google.android.documentsui", "com.sec.android.app.myfiles"),
+            "file manager" to listOf("com.google.android.documentsui", "com.sec.android.app.myfiles"),
+            "messages" to listOf("com.google.android.apps.messaging", "com.samsung.android.messaging"),
+            "sms" to listOf("com.google.android.apps.messaging", "com.samsung.android.messaging"),
+            "gmail" to listOf("com.google.android.gm"),
+            "email" to listOf("com.google.android.gm"),
+            "clock" to listOf("com.google.android.deskclock", "com.sec.android.app.clockpackage"),
+            "alarm" to listOf("com.google.android.deskclock", "com.sec.android.app.clockpackage"),
+            "music" to listOf("com.google.android.apps.youtube.music", "com.spotify.music"),
+            "spotify" to listOf("com.spotify.music"),
+            "telegram" to listOf("org.telegram.messenger"),
+            "facebook" to listOf("com.facebook.katana"),
+            "instagram" to listOf("com.instagram.android"),
+            "x" to listOf("com.twitter.android"),
+            "twitter" to listOf("com.twitter.android"),
+            "tiktok" to listOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill"),
+            "maps" to listOf("com.google.android.apps.maps"),
+            "recorder" to listOf("com.google.android.soundrecorder")
+        )
+    }
 
     // --- FLASHLIGHT ---
     fun setFlashlight(enabled: Boolean): String {
@@ -48,13 +93,13 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Error setting flashlight", e)
-            "Could not turn flashlight ${if (enabled) "on" else "off"}."
+            "Could not turn flashlight ${if (enabled) "on" else "off"}: ${e.localizedMessage}"
         }
     }
 
     // --- APP LAUNCHER ---
-    fun getInstalledApps(): List<Pair<String, String>> {
-        val apps = mutableListOf<Pair<String, String>>()
+    fun getInstalledApps(): List<AppInfo> {
+        val apps = mutableListOf<AppInfo>()
         try {
             val pm = context.packageManager
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
@@ -62,9 +107,11 @@ class DeviceControlManager(private val context: Context) {
             }
             val resolveInfos = pm.queryIntentActivities(intent, 0)
             for (info in resolveInfos) {
-                val label = info.loadLabel(pm).toString()
+                val label = info.loadLabel(pm).toString().trim()
                 val packageName = info.activityInfo.packageName
-                apps.add(label to packageName)
+                if (label.isNotEmpty()) {
+                    apps.add(AppInfo(label, packageName))
+                }
             }
         } catch (e: Exception) {
             Log.e(tag, "Error querying installed apps", e)
@@ -73,65 +120,108 @@ class DeviceControlManager(private val context: Context) {
     }
 
     fun launchApp(appNameQuery: String): String {
-        try {
-            val pm = context.packageManager
-            val cleanQuery = appNameQuery.lowercase(Locale.ROOT).trim()
-            val apps = getInstalledApps()
+        val cleanQuery = appNameQuery.lowercase(Locale.ROOT).trim()
+        if (cleanQuery.isEmpty()) return "Please specify an application to open."
 
-            // 1. Try exact match first
-            var matchedApp = apps.find { it.first.lowercase(Locale.ROOT) == cleanQuery }
-            
-            // 2. Try partial match
-            if (matchedApp == null) {
-                matchedApp = apps.find { it.first.lowercase(Locale.ROOT).contains(cleanQuery) }
-            }
+        val pm = context.packageManager
+        val installedApps = getInstalledApps()
 
-            // 3. Known package aliases fallback
-            val pkgFallback = when (cleanQuery) {
-                "whatsapp" -> "com.whatsapp"
-                "facebook" -> "com.facebook.katana"
-                "instagram" -> "com.instagram.android"
-                "telegram" -> "org.telegram.messenger"
-                "chrome" -> "com.android.chrome"
-                "settings" -> "com.android.settings"
-                "calculator", "calc" -> "com.google.android.calculator"
-                "camera" -> "com.android.camera"
-                "gallery", "photos" -> "com.google.android.apps.photos"
-                "youtube" -> "com.google.android.youtube"
-                "gmail" -> "com.google.android.gm"
-                "maps", "google maps" -> "com.google.android.apps.maps"
-                "play store", "store" -> "com.android.vending"
-                "file manager", "files" -> "com.google.android.documentsui"
-                "contacts" -> "com.google.android.contacts"
-                "recorder", "sound recorder" -> "com.google.android.soundrecorder"
-                else -> null
-            }
-
-            if (matchedApp != null) {
-                val intent = pm.getLaunchIntentForPackage(matchedApp.second)
-                if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                    return "Opening ${matchedApp.first}."
+        // 1. Check direct aliases first
+        val aliasPackages = COMMON_ALIASES[cleanQuery]
+        if (aliasPackages != null) {
+            for (pkg in aliasPackages) {
+                try {
+                    val intent = pm.getLaunchIntentForPackage(pkg)
+                    if (intent != null) {
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(intent)
+                        val label = installedApps.find { it.packageName == pkg }?.label ?: appNameQuery
+                        return "Opening $label."
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "Failed to launch alias package $pkg: ${e.message}", e)
+                    return "Failed to open $appNameQuery: ${e.localizedMessage}"
                 }
             }
-
-            if (pkgFallback != null) {
-                val intent = pm.getLaunchIntentForPackage(pkgFallback)
-                if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                    return "Opening $appNameQuery."
-                }
-            }
-
-            // Capitalize for clean message
-            val capitalizedName = appNameQuery.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-            return "$capitalizedName is not installed."
-        } catch (e: Exception) {
-            Log.e(tag, "Error launching app: $appNameQuery", e)
-            return "I couldn't open that app."
         }
+
+        // 2. Exact label match
+        var matchedApp = installedApps.find { it.label.lowercase(Locale.ROOT) == cleanQuery }
+
+        // 3. Label startsWith or contains
+        if (matchedApp == null) {
+            matchedApp = installedApps.find { it.label.lowercase(Locale.ROOT).startsWith(cleanQuery) }
+        }
+        if (matchedApp == null) {
+            matchedApp = installedApps.find { it.label.lowercase(Locale.ROOT).contains(cleanQuery) }
+        }
+
+        // 4. Fuzzy match score > 0.55
+        if (matchedApp == null) {
+            var bestScore = 0.0
+            var bestApp: AppInfo? = null
+            for (app in installedApps) {
+                val score = similarityScore(cleanQuery, app.label)
+                if (score > bestScore) {
+                    bestScore = score
+                    bestApp = app
+                }
+            }
+            if (bestScore > 0.55 && bestApp != null) {
+                matchedApp = bestApp
+            }
+        }
+
+        // 5. Package name match
+        if (matchedApp == null) {
+            matchedApp = installedApps.find { it.packageName.lowercase(Locale.ROOT).contains(cleanQuery) }
+        }
+
+        if (matchedApp != null) {
+            try {
+                val intent = pm.getLaunchIntentForPackage(matchedApp.packageName)
+                if (intent != null) {
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                    return "Opening ${matchedApp.label}."
+                } else {
+                    return "Could not launch ${matchedApp.label} (no launch intent found)."
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Exception starting activity for ${matchedApp.label}", e)
+                return "Failed to open ${matchedApp.label}: ${e.localizedMessage}"
+            }
+        }
+
+        val capitalizedName = appNameQuery.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+        return "$capitalizedName is not installed on this device."
+    }
+
+    private fun similarityScore(s1: String, s2: String): Double {
+        val str1 = s1.lowercase(Locale.ROOT).trim()
+        val str2 = s2.lowercase(Locale.ROOT).trim()
+        if (str1 == str2) return 1.0
+        if (str1.contains(str2) || str2.contains(str1)) return 0.8
+        val distance = levenshteinDistance(str1, str2)
+        val maxLength = maxOf(str1.length, str2.length)
+        return if (maxLength == 0) 1.0 else 1.0 - (distance.toDouble() / maxLength.toDouble())
+    }
+
+    private fun levenshteinDistance(a: String, b: String): Int {
+        val dp = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) dp[i][0] = i
+        for (j in 0..b.length) dp[0][j] = j
+        for (i in 1..a.length) {
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                dp[i][j] = minOf(
+                    dp[i - 1][j] + 1,
+                    dp[i][j - 1] + 1,
+                    dp[i - 1][j - 1] + cost
+                )
+            }
+        }
+        return dp[a.length][b.length]
     }
 
     // --- VOLUME & SOUND ---
@@ -173,7 +263,40 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Error controlling volume", e)
-            "Failed to change volume."
+            "Failed to change volume: ${e.localizedMessage}"
+        }
+    }
+
+    // --- RINGER MODE ---
+    fun setRingerMode(mode: String): String {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return "Audio manager unavailable."
+        return try {
+            when (mode.lowercase(Locale.ROOT)) {
+                "silent" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                        if (notificationManager?.isNotificationPolicyAccessGranted == false) {
+                            openSettingsScreen("dnd")
+                            return "Grant Do Not Disturb permission in Settings to enable silent mode."
+                        }
+                    }
+                    audioManager.ringerMode = AudioManager.RINGER_MODE_SILENT
+                    "Ringer set to Silent mode."
+                }
+                "vibrate" -> {
+                    audioManager.ringerMode = AudioManager.RINGER_MODE_VIBRATE
+                    "Ringer set to Vibrate mode."
+                }
+                "normal", "sound" -> {
+                    audioManager.ringerMode = AudioManager.RINGER_MODE_NORMAL
+                    "Ringer set to Normal sound mode."
+                }
+                else -> "Ringer mode updated."
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error setting ringer mode", e)
+            "Could not set ringer mode: ${e.localizedMessage}"
         }
     }
 
@@ -202,7 +325,7 @@ class DeviceControlManager(private val context: Context) {
             "Screen brightness set to ${(brightnessValue * 100).toInt()}%."
         } catch (e: Exception) {
             Log.e(tag, "Failed to set brightness", e)
-            "Could not set screen brightness."
+            "Could not set screen brightness: ${e.localizedMessage}"
         }
     }
 
@@ -220,6 +343,20 @@ class DeviceControlManager(private val context: Context) {
         }
     }
 
+    // --- SCREEN TIMEOUT ---
+    fun setScreenTimeout(seconds: Int): String {
+        if (!Settings.System.canWrite(context)) {
+            openSettingsScreen("display")
+            return "Permission required to change screen timeout."
+        }
+        return try {
+            Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_OFF_TIMEOUT, seconds * 1000)
+            "Screen timeout set to $seconds seconds."
+        } catch (e: Exception) {
+            "Could not set screen timeout: ${e.localizedMessage}"
+        }
+    }
+
     // --- BLUETOOTH & WIFI ---
     fun setBluetoothState(enabled: Boolean): String {
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -228,7 +365,8 @@ class DeviceControlManager(private val context: Context) {
 
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED &&
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            return "Permission is required to perform that action."
+            openSettingsScreen("bluetooth")
+            return "Permission or manual action is required to toggle Bluetooth."
         }
 
         return try {
@@ -242,17 +380,10 @@ class DeviceControlManager(private val context: Context) {
                 "Bluetooth disabled."
             }
         } catch (e: SecurityException) {
-            try {
-                val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-                "Opening Bluetooth settings."
-            } catch (ex: Exception) {
-                "Permission is required to control Bluetooth."
-            }
+            openSettingsScreen("bluetooth")
+            "Opening Bluetooth settings."
         } catch (e: Exception) {
-            "Could not change Bluetooth state."
+            "Could not change Bluetooth state: ${e.localizedMessage}"
         }
     }
 
@@ -274,7 +405,7 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Failed to toggle Wi-Fi", e)
-            "Could not change Wi-Fi state."
+            "Could not change Wi-Fi state: ${e.localizedMessage}"
         }
     }
 
@@ -318,7 +449,88 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Error setting DND", e)
-            "Could not change Do Not Disturb mode."
+            "Could not change Do Not Disturb mode: ${e.localizedMessage}"
+        }
+    }
+
+    // --- SYSTEM INFO (BATTERY, STORAGE, MEMORY) ---
+    fun getBatteryInfo(): String {
+        return try {
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            val level = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+            val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            val batteryStatus = context.registerReceiver(null, intentFilter)
+            val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+            val chargingStr = if (isCharging) " (charging)" else ""
+            if (level >= 0) {
+                "Battery level is $level%$chargingStr."
+            } else {
+                "Battery status unavailable."
+            }
+        } catch (e: Exception) {
+            "Could not read battery info: ${e.localizedMessage}"
+        }
+    }
+
+    fun getStorageInfo(): String {
+        return try {
+            val path = Environment.getDataDirectory().path
+            val stat = StatFs(path)
+            val blockSize = stat.blockSizeLong
+            val totalBlocks = stat.blockCountLong
+            val availableBlocks = stat.availableBlocksLong
+
+            val totalGB = (totalBlocks * blockSize) / (1024f * 1024f * 1024f)
+            val freeGB = (availableBlocks * blockSize) / (1024f * 1024f * 1024f)
+
+            "Storage: ${"%.1f".format(freeGB)} GB free of ${"%.1f".format(totalGB)} GB total."
+        } catch (e: Exception) {
+            "Could not read storage info: ${e.localizedMessage}"
+        }
+    }
+
+    fun getMemoryInfo(): String {
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                ?: return "Memory info unavailable."
+            val mi = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(mi)
+            val availMB = mi.availMem / (1024 * 1024)
+            val totalMB = mi.totalMem / (1024 * 1024)
+            "Memory (RAM): ${availMB} MB free of ${totalMB} MB total."
+        } catch (e: Exception) {
+            "Could not read memory info: ${e.localizedMessage}"
+        }
+    }
+
+    // --- ALARMS & CALENDAR ---
+    fun openAlarms(): String {
+        return try {
+            val intent = Intent(AlarmClock.ACTION_SHOW_ALARMS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (intent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(intent)
+                "Opening Alarms."
+            } else {
+                launchApp("clock")
+            }
+        } catch (e: Exception) {
+            launchApp("clock")
+        }
+    }
+
+    fun openCalendar(): String {
+        return try {
+            val intent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_APP_CALENDAR)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            "Opening Calendar."
+        } catch (e: Exception) {
+            openWebsite("https://calendar.google.com")
         }
     }
 
@@ -385,7 +597,6 @@ class DeviceControlManager(private val context: Context) {
                 context.startActivity(intent)
                 return "Calling $contactName."
             } else {
-                // Fallback to dialer
                 val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phoneNumber")).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
@@ -394,7 +605,7 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Error placing call", e)
-            return "I couldn't place that call."
+            return "I couldn't place that call: ${e.localizedMessage}"
         }
     }
 
@@ -426,7 +637,6 @@ class DeviceControlManager(private val context: Context) {
                 smsManager.sendTextMessage(phoneNumber, null, message, null, null)
                 return "SMS sent to $contactName."
             } else {
-                // Fallback to default SMS App
                 val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$phoneNumber")).apply {
                     putExtra("sms_body", message)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -436,7 +646,7 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Error sending SMS", e)
-            return "I couldn't send that SMS."
+            return "I couldn't send that SMS: ${e.localizedMessage}"
         }
     }
 
@@ -486,7 +696,7 @@ class DeviceControlManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Error opening camera mode: $mode", e)
-            "I couldn't open the camera."
+            "I couldn't open the camera: ${e.localizedMessage}"
         }
     }
 
@@ -538,7 +748,7 @@ class DeviceControlManager(private val context: Context) {
             "Music ${action.lowercase(Locale.ROOT)}."
         } catch (e: Exception) {
             Log.e(tag, "Error controlling music", e)
-            "Could not control music playback."
+            "Could not control music playback: ${e.localizedMessage}"
         }
     }
 
@@ -583,6 +793,8 @@ class DeviceControlManager(private val context: Context) {
             "accessibility" -> Settings.ACTION_ACCESSIBILITY_SETTINGS
             "applications", "apps" -> Settings.ACTION_APPLICATION_SETTINGS
             "tethering", "hotspot" -> Settings.ACTION_WIRELESS_SETTINGS
+            "display" -> Settings.ACTION_DISPLAY_SETTINGS
+            "dnd" -> Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS
             else -> Settings.ACTION_SETTINGS
         }
         return try {
@@ -592,7 +804,7 @@ class DeviceControlManager(private val context: Context) {
             context.startActivity(intent)
             "Opening settings."
         } catch (e: Exception) {
-            "Failed to open settings."
+            "Failed to open settings: ${e.localizedMessage}"
         }
     }
 
