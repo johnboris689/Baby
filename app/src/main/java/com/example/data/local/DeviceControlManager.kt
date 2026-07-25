@@ -194,7 +194,23 @@ class DeviceControlManager(private val context: Context) {
         }
 
         val capitalizedName = appNameQuery.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-        return "$capitalizedName is not installed on this device."
+        return try {
+            val playStoreIntent = Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=${Uri.encode(appNameQuery)}")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(playStoreIntent)
+            "$capitalizedName is not installed on this device. Opening Google Play Store to search for $capitalizedName."
+        } catch (e: Exception) {
+            try {
+                val webPlayIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/search?q=${Uri.encode(appNameQuery)}")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(webPlayIntent)
+                "$capitalizedName is not installed on this device. Opening Play Store web search."
+            } catch (ex: Exception) {
+                "$capitalizedName is not installed on this device."
+            }
+        }
     }
 
     private fun similarityScore(s1: String, s2: String): Double {

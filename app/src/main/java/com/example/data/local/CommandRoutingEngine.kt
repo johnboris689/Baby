@@ -9,11 +9,33 @@ sealed class RoutingResult {
 
 class CommandRoutingEngine(private val deviceControlManager: DeviceControlManager) {
 
-    fun routeAndExecute(rawInput: String): RoutingResult {
+    fun routeAndExecute(rawInput: String, isChainedSubcommand: Boolean = false): RoutingResult {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return RoutingResult.SendToGemini
 
         val lower = trimmed.lowercase(Locale.ROOT)
+
+        // 0. MULTI-ACTION COMMAND CHAINING ("and", "then")
+        if (!isChainedSubcommand && (lower.contains(" and ") || lower.contains(" then "))) {
+            val delimiter = if (lower.contains(" and ")) " and " else " then "
+            val parts = trimmed.split(Regex("(?i)$delimiter")).map { it.trim() }.filter { it.isNotEmpty() }
+            if (parts.size > 1) {
+                val results = mutableListOf<String>()
+                var allLocal = true
+                for (part in parts) {
+                    when (val res = routeAndExecute(part, isChainedSubcommand = true)) {
+                        is RoutingResult.LocalCommand -> results.add(res.responseText)
+                        is RoutingResult.SendToGemini -> {
+                            allLocal = false
+                            break
+                        }
+                    }
+                }
+                if (allLocal && results.isNotEmpty()) {
+                    return RoutingResult.LocalCommand(results.joinToString(" "))
+                }
+            }
+        }
 
         // 1. FLASHLIGHT COMMANDS
         if (isFlashlightOnCommand(lower)) {
