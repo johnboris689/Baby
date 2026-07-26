@@ -34,17 +34,9 @@ jobs:
           keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
         fi
 
-    - name: Validate & Repair Gradle Wrapper (Gradle 9.3.1)
-      run: |
-        if ! jar tf gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
-          echo "Gradle wrapper jar is corrupt or missing. Regenerating Gradle 9.3.1..."
-          gradle wrapper --gradle-version 9.3.1 || gradle wrapper
-          chmod +x gradlew
-        fi
-
     - name: Build Debug APK
       run: |
-        ./gradlew assembleDebug || gradle assembleDebug
+        ./gradlew assembleDebug
 
     - name: Upload Debug APK Artifact
       uses: actions/upload-artifact@v4
