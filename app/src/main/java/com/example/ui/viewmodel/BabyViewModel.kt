@@ -27,6 +27,7 @@ import com.example.data.repository.BabyRepository
 import com.example.data.local.DeviceControlManager
 import com.example.data.local.CommandRoutingEngine
 import com.example.data.local.RoutingResult
+import com.example.data.companion.*
 import com.example.ui.voice.VoiceManager
 import com.example.data.NetworkMonitor
 import android.content.BroadcastReceiver
@@ -604,9 +605,14 @@ class BabyViewModel(
             } catch (e: kotlinx.coroutines.CancellationException) {
                 repository.addLog("AI", "Generation job cancelled/interrupted.")
             } catch (e: Exception) {
-                repository.addLog("AI_Error", "Failed to generate AI response: ${e.message}")
-                repository.addMessage(convId, "assistant", "Error: ${e.localizedMessage}. Please verify settings or connection.", isError = true)
-                _assistantState.value = AssistantState.IDLE
+                repository.addLog("AI_Error", "Failed to generate online AI response: ${e.message}. Using offline companion logic.")
+                val detectedEmotion = EmotionDetector.detectEmotion(finalPrompt)
+                val offlineText = OfflineCompanionEngine.generateOfflineResponse(
+                    prompt = finalPrompt,
+                    memories = memories.value,
+                    emotion = detectedEmotion
+                )
+                simulateStreamingText(offlineText, convId)
             }
         }
     }
@@ -654,25 +660,34 @@ class BabyViewModel(
         history: List<Map<String, String>>,
         attachments: List<Attachment> = emptyList()
     ): String = withContext(Dispatchers.IO) {
+        val detectedEmotion = EmotionDetector.detectEmotion(prompt)
         val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
-        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
-            return@withContext "Welcome to Baby! Please enter your Gemini API Key in Settings to enable AI responses."
+
+        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY" || !_isInternetAvailable.value) {
+            return@withContext OfflineCompanionEngine.generateOfflineResponse(
+                prompt = prompt,
+                memories = memories.value,
+                emotion = detectedEmotion
+            )
         }
 
         repository.addLog("AI_Call", "Calling Gemini API with ${attachments.size} attachments...")
 
-        val maxMemories = if (_isPowerSaveActive.value) 1 else 5
+        val maxMemories = if (_isPowerSaveActive.value) 2 else 6
         val semanticResults = retrieveSemanticMemories(prompt, limit = maxMemories)
-        val memoryContext = if (semanticResults.isNotEmpty()) {
-            "Relevant user memories to remember:\n" + semanticResults.joinToString("\n") { "- ${it.first.content} (similarity score: ${"%.2f".format(it.second)})" } + "\n\n"
-        } else ""
+
+        val memoryList = memories.value
 
         val isPowerSave = _isPowerSaveActive.value
         val isDeepThinking = _thinkingMode.value == "deep"
-        val systemInstructionText = "You are Baby, a natural, emotionally intelligent AI assistant for Android. " +
-                "Use local memories if provided. Analyze any uploaded images, documents, audio, or video provided by the user. Keep your answers concise, engaging, and clear." +
-                (if (isPowerSave) " Power-save mode is active: restrict responses to be extremely short (under 15 words) to conserve battery." else "") +
-                (if (isDeepThinking) " Please think deeply. Start your response with your step-by-step reasoning process inside <thinking>...</thinking> XML tags." else "")
+
+        val systemInstructionText = CompanionPersonality.buildSystemPrompt(
+            memories = memoryList,
+            detectedEmotion = detectedEmotion,
+            isPowerSave = isPowerSave,
+            isDeepThinking = isDeepThinking
+        )
+
         val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
 
         val contents = mutableListOf<GeminiContent>()
@@ -839,33 +854,42 @@ class BabyViewModel(
             Log.d("BabyViewModel", "Skipping background memory extraction during Power-Save Mode.")
             return
         }
-        val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
-        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") return // Skip if no online key available
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val memoryPrompt = "Analyze the following message turn. " +
-                        "If the user shares an important fact, preference, preference rating, dog name, habit, or specific details about themselves, extract it into a 1-sentence statement starting with 'User...'. " +
-                        "If there is no personal info shared, return 'NONE'.\n\n" +
-                        "User: $userMsg\n" +
-                        "Assistant: $assistantMsg\n\n" +
-                        "Output Statement:"
+                // 1. Local Regex Relationship Fact Extraction
+                val localFacts = RelationshipMemoryExtractor.extractRelationshipFacts(userMsg)
+                localFacts.forEach { (factText, factType) ->
+                    val vectorStr = fetchEmbedding(factText)?.toEmbeddingString()
+                    repository.addMemory(factText, factType, 5, vectorStr)
+                }
 
-                val request = GeminiRequest(
-                    contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = memoryPrompt))))
-                )
+                // 2. Online Deep Fact Extraction via Gemini if Key is Present
+                val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
+                if (resolvedKey.isNotEmpty() && resolvedKey != "MY_GEMINI_API_KEY") {
+                    val memoryPrompt = "Analyze the following message turn. " +
+                            "If the user shares an important fact, preference, preference rating, dog name, habit, or specific details about themselves, extract it into a 1-sentence statement starting with 'User...'. " +
+                            "If there is no personal info shared, return 'NONE'.\n\n" +
+                            "User: $userMsg\n" +
+                            "Assistant: $assistantMsg\n\n" +
+                            "Output Statement:"
 
-                val response = ApiClients.geminiService.generateContent(
-                    model = "gemini-3.5-flash",
-                    apiKey = resolvedKey,
-                    request = request
-                )
+                    val request = GeminiRequest(
+                        contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = memoryPrompt))))
+                    )
 
-                val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text?.trim()
-                if (!text.isNullOrEmpty() && !text.contains("NONE", ignoreCase = true)) {
-                    val finalMemoryText = text.replace("Statement:", "").trim()
-                    val embeddingStr = fetchEmbedding(finalMemoryText)?.toEmbeddingString()
-                    repository.addMemory(finalMemoryText, "FACT", 4, embeddingStr)
+                    val response = ApiClients.geminiService.generateContent(
+                        model = "gemini-3.5-flash",
+                        apiKey = resolvedKey,
+                        request = request
+                    )
+
+                    val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text?.trim()
+                    if (!text.isNullOrEmpty() && !text.contains("NONE", ignoreCase = true)) {
+                        val finalMemoryText = text.replace("Statement:", "").trim()
+                        val embeddingStr = fetchEmbedding(finalMemoryText)?.toEmbeddingString()
+                        repository.addMemory(finalMemoryText, "FACT", 4, embeddingStr)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("BabyViewModel", "Failed to auto extract memory: ${e.message}")
