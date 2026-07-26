@@ -11,9 +11,11 @@ import com.example.BuildConfig
 import com.example.data.api.ApiClients
 import com.example.data.api.GeminiContent
 import com.example.data.api.GeminiPart
+import com.example.data.api.GeminiInlineData
 import com.example.data.api.GeminiRequest
 import com.example.data.api.GeminiResponse
 import com.example.data.api.GeminiGenerationConfig
+import com.example.data.model.Attachment
 import com.example.data.local.entity.ConversationEntity
 import com.example.data.local.entity.LogEntity
 import com.example.data.local.entity.MemoryEntity
@@ -61,6 +63,21 @@ class BabyViewModel(
 
     private val _partialSpeechText = MutableStateFlow("")
     val partialSpeechText: StateFlow<String> = _partialSpeechText.asStateFlow()
+
+    private val _pendingAttachments = MutableStateFlow<List<Attachment>>(emptyList())
+    val pendingAttachments: StateFlow<List<Attachment>> = _pendingAttachments.asStateFlow()
+
+    fun addAttachment(attachment: Attachment) {
+        _pendingAttachments.value = _pendingAttachments.value + attachment
+    }
+
+    fun removeAttachment(uri: android.net.Uri) {
+        _pendingAttachments.value = _pendingAttachments.value.filter { it.uri != uri }
+    }
+
+    fun clearAttachments() {
+        _pendingAttachments.value = emptyList()
+    }
 
     // --- Conversational State ---
     val conversations: StateFlow<List<ConversationEntity>> = repository.allConversations
@@ -530,8 +547,11 @@ class BabyViewModel(
     }
 
     fun sendMessage(content: String, isRegeneration: Boolean = false) {
-        if (content.trim().isEmpty() && !isRegeneration) return
+        val attachments = _pendingAttachments.value
+        if (content.trim().isEmpty() && attachments.isEmpty() && !isRegeneration) return
         val convId = _activeConversationId.value ?: return
+
+        _pendingAttachments.value = emptyList()
 
         // Cancel previous active jobs
         activeGenerationJob?.cancel()
@@ -539,8 +559,13 @@ class BabyViewModel(
         activeGenerationJob = viewModelScope.launch {
             try {
                 // Save User Message if not a regeneration
+                val displayPrompt = if (attachments.isNotEmpty()) {
+                    val attNames = attachments.joinToString(", ") { it.name }
+                    if (content.trim().isNotEmpty()) "$content\n[Attached: $attNames]" else "[Attached: $attNames]"
+                } else content
+
                 val finalPrompt = if (!isRegeneration) {
-                    repository.addMessage(convId, "user", content)
+                    repository.addMessage(convId, "user", displayPrompt)
                     content
                 } else {
                     activeMessages.value.lastOrNull { it.role == "user" }?.content ?: content
@@ -548,12 +573,14 @@ class BabyViewModel(
 
                 _assistantState.value = AssistantState.THINKING
 
-                // Intercept and run local device controls
-                val localResult = executeLocalDeviceControl(finalPrompt)
-                if (localResult != null) {
-                    repository.addLog("Device_Control", "Executed: $localResult")
-                    simulateStreamingText(localResult, convId)
-                    return@launch
+                // Intercept and run local device controls if no binary attachments are present
+                if (attachments.isEmpty()) {
+                    val localResult = executeLocalDeviceControl(finalPrompt)
+                    if (localResult != null) {
+                        repository.addLog("Device_Control", "Executed: $localResult")
+                        simulateStreamingText(localResult, convId)
+                        return@launch
+                    }
                 }
 
                 // If first message in a standard title conversation, auto generate a title
@@ -569,7 +596,7 @@ class BabyViewModel(
                     mapOf("role" to it.role, "content" to it.content)
                 }
 
-                val responseText = callOnlineAI(finalPrompt, activeMsgHistory)
+                val responseText = callOnlineAI(finalPrompt, activeMsgHistory, attachments)
 
                 // Simulate token-by-token response streaming
                 simulateStreamingText(responseText, convId)
@@ -622,33 +649,35 @@ class BabyViewModel(
         }
     }
 
-    private suspend fun callOnlineAI(prompt: String, history: List<Map<String, String>>): String = withContext(Dispatchers.IO) {
+    private suspend fun callOnlineAI(
+        prompt: String,
+        history: List<Map<String, String>>,
+        attachments: List<Attachment> = emptyList()
+    ): String = withContext(Dispatchers.IO) {
         val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
         if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
             return@withContext "Welcome to Baby! Please enter your Gemini API Key in Settings to enable AI responses."
         }
 
-        repository.addLog("AI_Call", "Calling Gemini API (Power-Save Active: ${_isPowerSaveActive.value})...")
+        repository.addLog("AI_Call", "Calling Gemini API with ${attachments.size} attachments...")
 
-        // Gather relevant memory context to enrich the conversation prompt using hybrid semantic vector search!
         val maxMemories = if (_isPowerSaveActive.value) 1 else 5
         val semanticResults = retrieveSemanticMemories(prompt, limit = maxMemories)
         val memoryContext = if (semanticResults.isNotEmpty()) {
             "Relevant user memories to remember:\n" + semanticResults.joinToString("\n") { "- ${it.first.content} (similarity score: ${"%.2f".format(it.second)})" } + "\n\n"
         } else ""
 
-        // Build Gemini request with system instructions and user history
         val isPowerSave = _isPowerSaveActive.value
         val isDeepThinking = _thinkingMode.value == "deep"
         val systemInstructionText = "You are Baby, a natural, emotionally intelligent AI assistant for Android. " +
-                "Use the local memories if provided. Keep your answers concise, engaging, and friendly." +
+                "Use local memories if provided. Analyze any uploaded images, documents, audio, or video provided by the user. Keep your answers concise, engaging, and clear." +
                 (if (isPowerSave) " Power-save mode is active: restrict responses to be extremely short (under 15 words) to conserve battery." else "") +
-                (if (isDeepThinking) " Please think deeply. Start your response with your step-by-step reasoning process inside <thinking>...</thinking> XML tags. For example: <thinking>To answer your question...</thinking> Here is the answer." else "")
+                (if (isDeepThinking) " Please think deeply. Start your response with your step-by-step reasoning process inside <thinking>...</thinking> XML tags." else "")
         val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
 
         val contents = mutableListOf<GeminiContent>()
 
-        // Append historical turns (last 10 turns max, or 3 if in Power-Save mode)
+        // Append historical turns
         val maxHistory = if (_isPowerSaveActive.value) 3 else 10
         history.takeLast(maxHistory).forEach { turn ->
             contents.add(
@@ -659,19 +688,35 @@ class BabyViewModel(
             )
         }
 
-        // If context is present, insert or prepend it to the final prompt
-        val enrichedPrompt = if (memoryContext.isNotEmpty()) {
-            "$memoryContext\nUser prompt: $prompt"
-        } else prompt
+        // Build current turn parts
+        val partsList = mutableListOf<GeminiPart>()
 
-        // Ensure the last item matches the enriched final prompt
-        if (contents.isNotEmpty() && contents.last().role == "user") {
-            contents[contents.lastIndex] = GeminiContent(role = "user", parts = listOf(GeminiPart(text = enrichedPrompt)))
-        } else {
-            contents.add(GeminiContent(role = "user", parts = listOf(GeminiPart(text = enrichedPrompt))))
+        // Add attachments (inline base64 images or extracted document text)
+        var docContext = ""
+        attachments.forEach { att ->
+            if (att.isImage && !att.base64Data.isNullOrEmpty()) {
+                partsList.add(
+                    GeminiPart(
+                        inlineData = GeminiInlineData(
+                            mimeType = att.mimeType,
+                            data = att.base64Data
+                        )
+                    )
+                )
+            } else if (!att.extractedText.isNullOrEmpty()) {
+                docContext += "\n[Attached file: ${att.name}]\n${att.extractedText}\n"
+            }
         }
 
-        // Restrict output length in Power-Save mode to save network and local TTS generation energy
+        var finalPromptText = if (memoryContext.isNotEmpty()) "$memoryContext\nUser prompt: $prompt" else prompt
+        if (docContext.isNotEmpty()) {
+            finalPromptText += "\n\nAttached File Contents:\n$docContext"
+        }
+
+        partsList.add(GeminiPart(text = finalPromptText))
+
+        contents.add(GeminiContent(role = "user", parts = partsList))
+
         val generationConfig = if (_isPowerSaveActive.value) {
             GeminiGenerationConfig(maxOutputTokens = 150)
         } else null

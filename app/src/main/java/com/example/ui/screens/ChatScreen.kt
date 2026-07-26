@@ -41,6 +41,11 @@ import com.example.ui.viewmodel.AssistantState
 import com.example.ui.viewmodel.BabyViewModel
 import com.example.ui.components.RichMarkdownText
 import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.lazy.LazyRow
+import com.example.data.model.Attachment
+import com.example.data.model.AttachmentHandler
 import kotlinx.coroutines.launch
 
 @Composable
@@ -54,6 +59,7 @@ fun ChatScreen(
     val messages by viewModel.activeMessages.collectAsState()
     val assistantState by viewModel.assistantState.collectAsState()
     val isInternetAvailable by viewModel.isInternetAvailable.collectAsState()
+    val pendingAttachments by viewModel.pendingAttachments.collectAsState()
 
     var showSidebar by remember { mutableStateOf(false) }
     var inputText by remember { mutableStateOf("") }
@@ -69,6 +75,17 @@ fun ChatScreen(
 
     val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        uris.forEach { uri ->
+            val attachment = AttachmentHandler.processUri(context, uri)
+            if (attachment != null) {
+                viewModel.addAttachment(attachment)
+            }
+        }
+    }
 
     // Auto-scroll to bottom when new messages arrive
     LaunchedEffect(messages.size, assistantState) {
@@ -483,6 +500,50 @@ fun ChatScreen(
                             .background(Color(0xFF0F172A).copy(alpha = 0.6f))
                             .padding(16.dp)
                     ) {
+                        if (pendingAttachments.isNotEmpty()) {
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(pendingAttachments) { att ->
+                                    Surface(
+                                        shape = RoundedCornerShape(16.dp),
+                                        color = Color(0xFF1E293B),
+                                        border = BorderStroke(1.dp, Color(0xFF3B82F6).copy(alpha = 0.4f))
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = if (att.isImage) Icons.Filled.Image else if (att.isPdf) Icons.Filled.PictureAsPdf else Icons.Filled.InsertDriveFile,
+                                                contentDescription = null,
+                                                tint = Color(0xFF60A5FA),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Text(
+                                                text = att.name,
+                                                color = Color.White,
+                                                fontSize = 12.sp,
+                                                maxLines = 1
+                                            )
+                                            Icon(
+                                                imageVector = Icons.Filled.Close,
+                                                contentDescription = "Remove",
+                                                tint = Color.White.copy(alpha = 0.6f),
+                                                modifier = Modifier
+                                                    .size(14.dp)
+                                                    .clickable { viewModel.removeAttachment(att.uri) }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
@@ -491,12 +552,13 @@ fun ChatScreen(
                             // Quick attachment shortcuts
                             IconButton(
                                 onClick = {
-                                    Toast.makeText(context, "Image attachments coming in next release!", Toast.LENGTH_SHORT).show()
+                                    filePickerLauncher.launch("*/*")
                                 },
                                 modifier = Modifier
                                     .size(42.dp)
                                     .clip(CircleShape)
                                     .background(Color.White.copy(alpha = 0.05f))
+                                    .testTag("attachment_button")
                             ) {
                                 Icon(imageVector = Icons.Filled.AttachFile, contentDescription = "Attach File", tint = Color.White.copy(alpha = 0.6f))
                             }
@@ -525,7 +587,7 @@ fun ChatScreen(
                             // Send or Mic Action button
                             IconButton(
                                 onClick = {
-                                    if (inputText.trim().isNotEmpty()) {
+                                    if (inputText.trim().isNotEmpty() || pendingAttachments.isNotEmpty()) {
                                         viewModel.sendMessage(inputText)
                                         inputText = ""
                                     } else {
@@ -536,7 +598,7 @@ fun ChatScreen(
                                     .size(48.dp)
                                     .clip(CircleShape)
                                     .background(
-                                        if (inputText.trim().isNotEmpty()) {
+                                        if (inputText.trim().isNotEmpty() || pendingAttachments.isNotEmpty()) {
                                             Brush.linearGradient(colors = listOf(Color(0xFF3B82F6), Color(0xFF6366F1)))
                                         } else {
                                             Brush.linearGradient(colors = listOf(Color(0xFFEC4899), Color(0xFF8B5CF6)))
@@ -545,7 +607,7 @@ fun ChatScreen(
                                     .testTag("chat_send_button")
                             ) {
                                 Icon(
-                                    imageVector = if (inputText.trim().isNotEmpty()) Icons.AutoMirrored.Filled.Send else Icons.Filled.Mic,
+                                    imageVector = if (inputText.trim().isNotEmpty() || pendingAttachments.isNotEmpty()) Icons.AutoMirrored.Filled.Send else Icons.Filled.Mic,
                                     contentDescription = "Send",
                                     tint = Color.White,
                                     modifier = Modifier.size(20.dp)

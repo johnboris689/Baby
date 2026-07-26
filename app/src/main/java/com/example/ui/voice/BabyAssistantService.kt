@@ -63,7 +63,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
     // Setting values
     private var wakeWordEnabled = true
-    private var wakePhrases = setOf("hey baby", "hi baby", "hello baby", "baby")
+    private var wakePhrases = setOf("hey baby", "hi baby", "hello baby", "baby", "good morning baby")
 
     private val notificationReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {

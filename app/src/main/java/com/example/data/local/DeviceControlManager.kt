@@ -36,6 +36,7 @@ data class AppInfo(val label: String, val packageName: String)
 class DeviceControlManager(private val context: Context) {
 
     private val tag = "DeviceControlManager"
+    private val packageCacheManager = PackageCacheManager(context)
 
     companion object {
         val COMMON_ALIASES = mapOf(
@@ -99,9 +100,10 @@ class DeviceControlManager(private val context: Context) {
 
     // --- APP LAUNCHER ---
     fun getInstalledApps(): List<AppInfo> {
-        val apps = mutableListOf<AppInfo>()
+        val appsMap = mutableMapOf<String, AppInfo>()
         try {
             val pm = context.packageManager
+            // 1. Query launcher intents
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
@@ -109,107 +111,167 @@ class DeviceControlManager(private val context: Context) {
             for (info in resolveInfos) {
                 val label = info.loadLabel(pm).toString().trim()
                 val packageName = info.activityInfo.packageName
-                if (label.isNotEmpty()) {
-                    apps.add(AppInfo(label, packageName))
+                if (label.isNotEmpty() && packageName.isNotEmpty()) {
+                    appsMap[packageName] = AppInfo(label, packageName)
+                }
+            }
+
+            // 2. Query all installed packages to ensure no launchable application is missed
+            val installedPackages = pm.getInstalledPackages(0)
+            for (pkgInfo in installedPackages) {
+                val pkgName = pkgInfo.packageName
+                if (!appsMap.containsKey(pkgName)) {
+                    val launchIntent = pm.getLaunchIntentForPackage(pkgName)
+                    if (launchIntent != null) {
+                        val label = pkgInfo.applicationInfo?.loadLabel(pm)?.toString()?.trim() ?: pkgName
+                        appsMap[pkgName] = AppInfo(label, pkgName)
+                    }
                 }
             }
         } catch (e: Exception) {
             Log.e(tag, "Error querying installed apps", e)
         }
-        return apps
+        return appsMap.values.toList()
     }
 
     fun launchApp(appNameQuery: String): String {
-        val cleanQuery = appNameQuery.lowercase(Locale.ROOT).trim()
+        var cleanQuery = appNameQuery.lowercase(Locale.ROOT).trim()
         if (cleanQuery.isEmpty()) return "Please specify an application to open."
+
+        // Remove trailing noise words
+        if (cleanQuery.endsWith(" app")) {
+            cleanQuery = cleanQuery.substring(0, cleanQuery.length - 4).trim()
+        } else if (cleanQuery.endsWith(" application")) {
+            cleanQuery = cleanQuery.substring(0, cleanQuery.length - 12).trim()
+        }
 
         val pm = context.packageManager
         val installedApps = getInstalledApps()
 
-        // 1. Check direct aliases first
-        val aliasPackages = COMMON_ALIASES[cleanQuery]
-        if (aliasPackages != null) {
-            for (pkg in aliasPackages) {
+        // 1. Check Package Cache Manager / Well-Known Package Mappings
+        val cachedPkg = packageCacheManager.getCachedPackage(cleanQuery)
+        if (cachedPkg != null) {
+            val launchIntent = pm.getLaunchIntentForPackage(cachedPkg)
+            if (launchIntent != null) {
                 try {
-                    val intent = pm.getLaunchIntentForPackage(pkg)
-                    if (intent != null) {
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(intent)
-                        val label = installedApps.find { it.packageName == pkg }?.label ?: appNameQuery
-                        return "Opening $label."
-                    }
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launchIntent)
+                    packageCacheManager.saveLearnedPackage(cleanQuery, cachedPkg)
+                    val label = installedApps.find { it.packageName == cachedPkg }?.label ?: appNameQuery.replaceFirstChar { it.uppercase() }
+                    return "Opening $label."
                 } catch (e: Exception) {
-                    Log.e(tag, "Failed to launch alias package $pkg: ${e.message}", e)
-                    return "Failed to open $appNameQuery: ${e.localizedMessage}"
+                    Log.e(tag, "Failed to launch cached package $cachedPkg", e)
                 }
             }
         }
 
-        // 2. Exact label match
-        var matchedApp = installedApps.find { it.label.lowercase(Locale.ROOT) == cleanQuery }
-
-        // 3. Label startsWith or contains
-        if (matchedApp == null) {
-            matchedApp = installedApps.find { it.label.lowercase(Locale.ROOT).startsWith(cleanQuery) }
-        }
-        if (matchedApp == null) {
-            matchedApp = installedApps.find { it.label.lowercase(Locale.ROOT).contains(cleanQuery) }
+        // 2. Exact label match (case insensitive)
+        val exactMatches = installedApps.filter { it.label.lowercase(Locale.ROOT) == cleanQuery }
+        if (exactMatches.size == 1) {
+            return performAppLaunch(exactMatches.first(), cleanQuery)
+        } else if (exactMatches.size > 1) {
+            val names = exactMatches.joinToString(", ") { it.label }
+            return "I found multiple matching applications: $names. Which one would you like to open?"
         }
 
-        // 4. Fuzzy match score > 0.55
-        if (matchedApp == null) {
-            var bestScore = 0.0
-            var bestApp: AppInfo? = null
-            for (app in installedApps) {
-                val score = similarityScore(cleanQuery, app.label)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestApp = app
-                }
-            }
-            if (bestScore > 0.55 && bestApp != null) {
-                matchedApp = bestApp
-            }
+        // 3. Label starts with or query starts with label
+        val prefixMatches = installedApps.filter {
+            val lbl = it.label.lowercase(Locale.ROOT)
+            lbl.startsWith(cleanQuery) || cleanQuery.startsWith(lbl)
+        }
+        if (prefixMatches.size == 1) {
+            return performAppLaunch(prefixMatches.first(), cleanQuery)
+        } else if (prefixMatches.size > 1) {
+            val names = prefixMatches.map { it.label }.distinct().take(4).joinToString(", ")
+            return "I found multiple matching applications: $names. Which one would you like to open?"
+        }
+
+        // 4. Substring contains match
+        val containsMatches = installedApps.filter {
+            val lbl = it.label.lowercase(Locale.ROOT)
+            lbl.contains(cleanQuery) || cleanQuery.contains(lbl)
+        }
+        if (containsMatches.size == 1) {
+            return performAppLaunch(containsMatches.first(), cleanQuery)
+        } else if (containsMatches.size > 1) {
+            val names = containsMatches.map { it.label }.distinct().take(4).joinToString(", ")
+            return "I found multiple matching applications: $names. Which one would you like to open?"
         }
 
         // 5. Package name match
-        if (matchedApp == null) {
-            matchedApp = installedApps.find { it.packageName.lowercase(Locale.ROOT).contains(cleanQuery) }
+        val pkgMatches = installedApps.filter { it.packageName.lowercase(Locale.ROOT).contains(cleanQuery) }
+        if (pkgMatches.size == 1) {
+            return performAppLaunch(pkgMatches.first(), cleanQuery)
         }
 
-        if (matchedApp != null) {
-            try {
-                val intent = pm.getLaunchIntentForPackage(matchedApp.packageName)
-                if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                    return "Opening ${matchedApp.label}."
-                } else {
-                    return "Could not launch ${matchedApp.label} (no launch intent found)."
-                }
-            } catch (e: Exception) {
-                Log.e(tag, "Exception starting activity for ${matchedApp.label}", e)
-                return "Failed to open ${matchedApp.label}: ${e.localizedMessage}"
+        // 6. Fuzzy Levenshtein match score
+        var bestScore = 0.0
+        var bestApp: AppInfo? = null
+        val candidatesAboveThreshold = mutableListOf<AppInfo>()
+        for (app in installedApps) {
+            val score = similarityScore(cleanQuery, app.label.lowercase(Locale.ROOT))
+            if (score > 0.45) {
+                candidatesAboveThreshold.add(app)
+            }
+            if (score > bestScore) {
+                bestScore = score
+                bestApp = app
             }
         }
 
+        if (candidatesAboveThreshold.size == 1) {
+            return performAppLaunch(candidatesAboveThreshold.first(), cleanQuery)
+        } else if (candidatesAboveThreshold.size > 1 && bestScore > 0.55 && bestApp != null) {
+            return performAppLaunch(bestApp, cleanQuery)
+        }
+
+        // 7. If app is not installed locally on device -> Fallback to Google Play Store
         val capitalizedName = appNameQuery.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+        val targetPkg = cachedPkg ?: packageCacheManager.getCachedPackage(cleanQuery)
         return try {
-            val playStoreIntent = Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=${Uri.encode(appNameQuery)}")).apply {
+            val playStoreUri = if (targetPkg != null) {
+                Uri.parse("market://details?id=$targetPkg")
+            } else {
+                Uri.parse("market://search?q=${Uri.encode(appNameQuery)}")
+            }
+            val playStoreIntent = Intent(Intent.ACTION_VIEW, playStoreUri).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(playStoreIntent)
-            "$capitalizedName is not installed on this device. Opening Google Play Store to search for $capitalizedName."
+            "$capitalizedName is not installed on this device. Opening Google Play Store to install it."
         } catch (e: Exception) {
             try {
-                val webPlayIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/search?q=${Uri.encode(appNameQuery)}")).apply {
+                val webPlayUri = if (targetPkg != null) {
+                    Uri.parse("https://play.google.com/store/apps/details?id=$targetPkg")
+                } else {
+                    Uri.parse("https://play.google.com/store/search?q=${Uri.encode(appNameQuery)}")
+                }
+                val webPlayIntent = Intent(Intent.ACTION_VIEW, webPlayUri).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(webPlayIntent)
-                "$capitalizedName is not installed on this device. Opening Play Store web search."
+                "$capitalizedName is not installed on this device. Opening Play Store web page."
             } catch (ex: Exception) {
                 "$capitalizedName is not installed on this device."
             }
+        }
+    }
+
+    private fun performAppLaunch(app: AppInfo, query: String): String {
+        return try {
+            val pm = context.packageManager
+            val intent = pm.getLaunchIntentForPackage(app.packageName)
+            if (intent != null) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                packageCacheManager.saveLearnedPackage(query, app.packageName)
+                "Opening ${app.label}."
+            } else {
+                "Could not launch ${app.label} (no launch intent found)."
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Exception starting activity for ${app.label}", e)
+            "Failed to open ${app.label}: ${e.localizedMessage}"
         }
     }
 
