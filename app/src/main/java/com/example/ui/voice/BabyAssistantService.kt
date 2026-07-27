@@ -287,10 +287,14 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 Log.d(tag, "Passive wake-word AudioRecord session started successfully")
 
                 val buffer = ShortArray(bufferSize / 2)
+                var consecutiveSpeechFrames = 0
+                var noiseFloorSum = 0.0
+                var noiseSampleCount = 0
+                var estimatedNoiseFloor = 1000.0
 
                 while (isActive && isPassiveListening && wakeWordEnabled) {
                     if (isProcessingCommand || isSpeaking) {
-                        delay(200)
+                        delay(300)
                         continue
                     }
 
@@ -308,33 +312,55 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     }
                     val rms = Math.sqrt(sumSquare / readSize).toFloat()
 
-                    // 2. VAD Filter: Ignore audio below minimum speech energy threshold
-                    if (rms < minSpeechThreshold) {
-                        continue // Ignore background noise, fans, TV, breathing, keyboard
+                    // 2. Track background noise floor during quiet periods
+                    if (noiseSampleCount < 15) {
+                        noiseFloorSum += rms
+                        noiseSampleCount++
+                        if (noiseSampleCount == 15) {
+                            estimatedNoiseFloor = noiseFloorSum / 15.0
+                            Log.d(tag, "Estimated ambient noise floor: $estimatedNoiseFloor")
+                        }
                     }
 
-                    // 3. Speech detected above threshold!
+                    val dynamicThreshold = Math.max(minSpeechThreshold.toDouble(), estimatedNoiseFloor * 2.2).toFloat()
+
+                    // 3. VAD Filter: Check sustained speech activity to filter out transient pops, clicks, fan noise, breathing
+                    if (rms < dynamicThreshold) {
+                        consecutiveSpeechFrames = 0
+                        continue
+                    }
+
+                    consecutiveSpeechFrames++
+                    // Require at least 3 consecutive frames (~300ms) of speech energy
+                    if (consecutiveSpeechFrames < 3) {
+                        continue
+                    }
+
+                    // Sustained speech detected! Reset frame counter
+                    consecutiveSpeechFrames = 0
                     val now = System.currentTimeMillis()
 
                     // Check automatic suppression of repeated false activations
                     if (now < suppressionUntilMs) {
                         Log.d(tag, "Wake-word trigger suppressed due to recent repeated false activations")
+                        delay(1000)
                         continue
                     }
 
                     // Check Debounce window
                     if (now - lastTriggerTimeMs < DEBOUNCE_WINDOW_MS) {
                         Log.d(tag, "Trigger ignored: within debounce window (${now - lastTriggerTimeMs}ms)")
+                        delay(1000)
                         continue
                     }
 
-                    // 4. Candidate speech activity detected above threshold -> check wake word on Main thread
+                    // 4. Evaluate wake word candidate
                     withContext(Dispatchers.Main) {
                         evaluateSpeechCandidate(rms)
                     }
 
-                    // Pause briefly after candidate check
-                    delay(1500)
+                    // Cooldown pause after candidate check
+                    delay(2500)
                 }
             } catch (e: Exception) {
                 Log.e(tag, "Silent background error in passive listening loop: ${e.message}")

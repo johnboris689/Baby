@@ -51,7 +51,29 @@ class PackageCacheManager(context: Context) {
             "file manager" to listOf("com.google.android.documentsui", "com.sec.android.app.myfiles"),
             "settings" to listOf("com.android.settings"),
             "messages" to listOf("com.google.android.apps.messaging", "com.samsung.android.messaging"),
-            "sms" to listOf("com.google.android.apps.messaging", "com.samsung.android.messaging")
+            "sms" to listOf("com.google.android.apps.messaging", "com.samsung.android.messaging"),
+            "uber" to listOf("com.ubercab"),
+            "lyft" to listOf("me.lyft.android"),
+            "discord" to listOf("com.discord"),
+            "reddit" to listOf("com.reddit.frontpage"),
+            "zoom" to listOf("us.zoom.videomeetings"),
+            "teams" to listOf("com.microsoft.teams"),
+            "microsoft teams" to listOf("com.microsoft.teams"),
+            "slack" to listOf("com.Slack"),
+            "outlook" to listOf("com.microsoft.office.outlook"),
+            "amazon" to listOf("com.amazon.mShop.android.shopping"),
+            "pinterest" to listOf("com.pinterest"),
+            "linkedin" to listOf("com.linkedin.android"),
+            "duolingo" to listOf("com.duolingo"),
+            "capcut" to listOf("com.lemon.lvoverseas"),
+            "canva" to listOf("com.canva.editor"),
+            "shazam" to listOf("com.shazam.android"),
+            "audible" to listOf("com.audible.application"),
+            "twitch" to listOf("tv.twitch.android.app"),
+            "signal" to listOf("org.thoughtcrime.securesms"),
+            "doordash" to listOf("com.dd.doordash"),
+            "ubereats" to listOf("com.ubercab.eats"),
+            "airbnb" to listOf("com.airbnb.android")
         )
     }
 
@@ -63,7 +85,14 @@ class PackageCacheManager(context: Context) {
 
         // 2. Check built-in well-known mappings
         val list = WELL_KNOWN_PACKAGES[cleanKey]
-        return list?.firstOrNull()
+        if (!list.isNullOrEmpty()) return list.first()
+
+        // 3. Fallback: check if cleanKey resembles a package name format
+        if (cleanKey.contains(".") && cleanKey.split(".").size >= 2) {
+            return cleanKey
+        }
+
+        return null
     }
 
     fun saveLearnedPackage(query: String, packageName: String) {
