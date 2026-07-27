@@ -432,7 +432,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             falseTriggerCount = 0
 
             Log.d(tag, "CONFIDENT WAKE-WORD DETECTED! Matched: '$matchedPhrase', Text: '$text', Confidence: $highestConfidence, RMS: $rms")
-            repository?.addLog("Voice_Service", "Wake-word detected: '$matchedPhrase' (Confidence: ${"%.2f".format(highestConfidence)})")
+            scope.launch { repository?.addLog("Voice_Service", "Wake-word detected: '$matchedPhrase' (Confidence: ${"%.2f".format(highestConfidence)})") }
 
             triggerWakeActivation()
         } else {
@@ -448,7 +448,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 if (falseTriggerCount >= 3) {
                     suppressionUntilMs = now + 15000 // Suppress triggers for 15s
                     Log.w(tag, "Automatic suppression activated for 15s due to $falseTriggerCount false candidate triggers in 20s")
-                    repository?.addLog("Voice_Service", "Suppression activated for 15s due to repeated false triggers")
+                    scope.launch { repository?.addLog("Voice_Service", "Suppression activated for 15s due to repeated false triggers") }
                 }
             }
 

@@ -558,6 +558,7 @@ class BabyViewModel(
         activeGenerationJob?.cancel()
 
         activeGenerationJob = viewModelScope.launch {
+            var finalPrompt = content
             try {
                 // Save User Message if not a regeneration
                 val displayPrompt = if (attachments.isNotEmpty()) {
@@ -565,7 +566,7 @@ class BabyViewModel(
                     if (content.trim().isNotEmpty()) "$content\n[Attached: $attNames]" else "[Attached: $attNames]"
                 } else content
 
-                val finalPrompt = if (!isRegeneration) {
+                finalPrompt = if (!isRegeneration) {
                     repository.addMessage(convId, "user", displayPrompt)
                     content
                 } else {
@@ -675,6 +676,10 @@ class BabyViewModel(
 
         val maxMemories = if (_isPowerSaveActive.value) 2 else 6
         val semanticResults = retrieveSemanticMemories(prompt, limit = maxMemories)
+
+        val memoryContext = if (semanticResults.isNotEmpty()) {
+            "Relevant user memories to remember:\n" + semanticResults.joinToString("\n") { "- ${it.first.content} (similarity score: ${"%.2f".format(it.second)})" } + "\n\n"
+        } else ""
 
         val memoryList = memories.value
 
