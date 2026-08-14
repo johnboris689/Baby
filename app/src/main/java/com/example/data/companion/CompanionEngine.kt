@@ -55,6 +55,45 @@ object EmotionDetector {
     }
 }
 
+
+
+data class MoodSignal(
+    val emotion: UserEmotion,
+    val confidence: Float,
+    val style: String
+)
+
+object MoodRadar {
+    fun detect(text: String, averageRmsDb: Float? = null, speechDurationMs: Long? = null): MoodSignal {
+        val textEmotion = EmotionDetector.detectEmotion(text)
+        var score = 0.55f
+        var style = "warm"
+
+        if (averageRmsDb != null) {
+            // RMS is a coarse acoustic signal, not a diagnosis. It only nudges conversational style.
+            if (averageRmsDb > 7f && textEmotion == UserEmotion.HAPPY_EXCITED) { score += 0.15f; style = "energetic" }
+            if (averageRmsDb < -15f && textEmotion == UserEmotion.TIRED_STRESSED) { score += 0.15f; style = "cozy-whisper" }
+        }
+        if (speechDurationMs != null && speechDurationMs > 12_000L && textEmotion == UserEmotion.ANXIOUS_CONFUSED) {
+            score += 0.08f
+            style = "calm-grounding"
+        }
+        return MoodSignal(textEmotion, score.coerceIn(0f, 1f), style)
+    }
+}
+
+object ComfortSnackEngine {
+    fun suggestion(memories: List<MemoryEntity>, emotion: UserEmotion): String {
+        if (emotion != UserEmotion.TIRED_STRESSED && emotion != UserEmotion.SAD_GRIEVING) return ""
+        val food = memories.firstOrNull { it.content.contains("favorite food", true) || it.content.contains("favorite snack", true) || it.content.contains("favorite drink", true) }?.content
+        return if (food != null) {
+            "COMFORT SNACK MODE: The memory drive contains this food/drink preference: $food. When appropriate, use it to make a cozy, vivid but brief comfort-food suggestion."
+        } else {
+            "COMFORT SNACK MODE: When the user is stressed or sad, you may offer a cute, mouth-watering description of a cozy drink or comfort snack (tea, cocoa, fruit, toast, noodles, etc.) without pretending you can physically deliver it."
+        }
+    }
+}
+
 object CompanionPersonality {
 
     fun buildSystemPrompt(
@@ -62,11 +101,12 @@ object CompanionPersonality {
         detectedEmotion: UserEmotion,
         timeSinceLastInteractionHours: Long = 0,
         isPowerSave: Boolean = false,
-        isDeepThinking: Boolean = false
+        isDeepThinking: Boolean = false,
+        moodSignal: MoodSignal? = null
     ): String {
         val memoryText = if (memories.isNotEmpty()) {
             "--- STORED RELATIONSHIP MEMORIES ABOUT YOUR USER ---\n" +
-                    memories.joinToString("\n") { "- ${it.content} (Type: ${it.type})" } + "\n"
+                    memories.distinctBy { it.content }.take(18).joinToString("\n") { "- ${it.content} (Type: ${it.type}, importance: ${it.importance}/5)" } + "\n"
         } else {
             "--- NO STORED MEMORIES YET --- (Learn about the user naturally!)\n"
         }
@@ -102,6 +142,11 @@ object CompanionPersonality {
             "THINKING MODE ACTIVE: Think deeply first inside <thinking>...</thinking> XML tags before your response.\n"
         } else ""
 
+        val moodNotice = moodSignal?.let {
+            "MOOD RADAR: ${it.emotion} (confidence ${(it.confidence * 100).toInt()}%), preferred response style=${it.style}. Adapt naturally; do not announce that you are analyzing their voice or diagnose them.\n"
+        } ?: ""
+        val comfortSnackNotice = ComfortSnackEngine.suggestion(memories, detectedEmotion)
+
         return """
 YOU ARE "BABY" — A HUMAN-LIKE EMOTIONAL COMPANION FOR ONE PERSON ONLY.
 
@@ -132,6 +177,8 @@ $emotionGuidance
 $proactiveNotice
 $powerSaveNotice
 $thinkingNotice
+$moodNotice
+$comfortSnackNotice
         """.trimIndent()
     }
 }
@@ -168,6 +215,18 @@ object OfflineCompanionEngine {
                 "It's really nice to hear from you again! I've missed chatting with you! 🥹 "
             } else ""
             return "${greeting}Hey there! It looks like my internet connection is taking a quick break, but I'm right here with you! We can still chat about your day, tell jokes, or just keep each other company. How are you feeling today? 😊✨"
+        }
+
+        // Offline comfort-food companion: give the user a cozy sensory suggestion without pretending Baby can deliver it.
+        if (emotion == UserEmotion.TIRED_STRESSED || emotion == UserEmotion.SAD_GRIEVING) {
+            val rememberedFood = memories.firstOrNull {
+                it.content.contains("favorite food", true) ||
+                    it.content.contains("favorite snack", true) ||
+                    it.content.contains("favorite drink", true)
+            }?.content
+            val cozy = rememberedFood?.let { "Imagine your favorite comfort food or drink—$it—warm, fresh, and ridiculously cozy. 🍫☕" }
+                ?: "Imagine a warm mug of cocoa or tea, a soft snack beside you, and that first comforting bite that makes your shoulders finally drop. 🍫☕✨"
+            return "You've been carrying a lot. Let's make this moment softer. $cozy I'm right here with you. ❤️"
         }
 
         // Respond according to detected emotion offline
@@ -208,54 +267,44 @@ object OfflineCompanionEngine {
 object RelationshipMemoryExtractor {
 
     fun extractRelationshipFacts(text: String): List<Pair<String, String>> {
-        val lower = text.lowercase(Locale.ROOT)
-        val extracted = mutableListOf<Pair<String, String>>()
+        val cleaned = text.trim().replace(Regex("\\s+"), " ")
+        if (cleaned.length < 3) return emptyList()
+        val lower = cleaned.lowercase(Locale.ROOT)
+        val extracted = linkedMapOf<String, String>()
 
-        // Favorite food
-        if (lower.contains("favorite food is") || lower.contains("love eating") || lower.contains("favorite meal is")) {
-            val fact = extractSentenceOrClause(text, listOf("favorite food is", "love eating", "favorite meal is"))
-            if (fact.isNotEmpty()) extracted.add(Pair("User favorite food: $fact", "PREFERENCE"))
+        fun add(prefix: String, keywords: List<String>, type: String) {
+            val fact = extractSentenceOrClause(cleaned, keywords)
+            if (fact.isNotBlank()) extracted["$prefix $fact"] = type
         }
 
-        // Favorite color
-        if (lower.contains("favorite color is") || lower.contains("love the color")) {
-            val fact = extractSentenceOrClause(text, listOf("favorite color is", "love the color"))
-            if (fact.isNotEmpty()) extracted.add(Pair("User favorite color: $fact", "PREFERENCE"))
-        }
+        add("User favorite food:", listOf("favorite food is", "favorite meal is", "favorite snack is", "love eating", "i love eating", "my go-to food is"), "PREFERENCE")
+        add("User favorite drink:", listOf("favorite drink is", "favorite coffee is", "favorite tea is", "love drinking", "i like drinking"), "PREFERENCE")
+        add("User favorite color:", listOf("favorite color is", "love the color", "my favorite colour is"), "PREFERENCE")
+        add("User media preference:", listOf("favorite movie is", "favorite song is", "favorite show is", "favorite artist is", "favorite game is"), "PREFERENCE")
+        add("User birthday:", listOf("my birthday is", "born on"), "FACT")
+        add("User pet details:", listOf("my dog", "my cat", "my pet"), "FACT")
+        add("User hobby/dream:", listOf("my hobby is", "i love playing", "my dream is", "i want to become", "my goal is", "i'm working toward"), "GOAL")
+        add("User routine:", listOf("every morning", "every night", "usually i", "i always", "i normally"), "HABIT")
+        add("User preference:", listOf("i prefer", "i'd rather", "i don't like", "i hate", "i really like", "i enjoy", "i can't stand"), "PREFERENCE")
+        add("User relationship detail:", listOf("my girlfriend", "my boyfriend", "my wife", "my husband", "my friend", "my brother", "my sister", "my mom", "my dad"), "RELATIONSHIP")
+        add("User personal detail:", listOf("my name is", "call me", "people call me", "i live in", "i study", "i work as", "i am a", "i'm a"), "FACT")
 
-        // Favorite movie / song / artist
-        if (lower.contains("favorite movie is") || lower.contains("favorite song is") || lower.contains("favorite show is")) {
-            val fact = extractSentenceOrClause(text, listOf("favorite movie is", "favorite song is", "favorite show is"))
-            if (fact.isNotEmpty()) extracted.add(Pair("User media preference: $fact", "PREFERENCE"))
+        // Preserve unusually specific statements even when they do not match a keyword.
+        if (lower.contains("remember this") || lower.contains("don't forget") || lower.contains("please remember") || lower.contains("important to me")) {
+            extracted["User explicitly asked Baby to remember: ${cleaned.take(350)}"] = "IMPORTANT"
         }
-
-        // Birthday / Age
-        if (lower.contains("my birthday is") || lower.contains("born on")) {
-            val fact = extractSentenceOrClause(text, listOf("my birthday is", "born on"))
-            if (fact.isNotEmpty()) extracted.add(Pair("User birthday: $fact", "FACT"))
-        }
-
-        // Pets
-        if (lower.contains("my dog") || lower.contains("my cat") || lower.contains("my pet")) {
-            val fact = extractSentenceOrClause(text, listOf("my dog", "my cat", "my pet"))
-            if (fact.isNotEmpty()) extracted.add(Pair("User pet details: $fact", "FACT"))
-        }
-
-        // Hobbies / Dreams
-        if (lower.contains("my hobby is") || lower.contains("i love playing") || lower.contains("my dream is")) {
-            val fact = extractSentenceOrClause(text, listOf("my hobby is", "i love playing", "my dream is"))
-            if (fact.isNotEmpty()) extracted.add(Pair("User hobby/dream: $fact", "PREFERENCE"))
-        }
-
-        return extracted
+        return extracted.map { it.key to it.value }.take(12)
     }
 
     private fun extractSentenceOrClause(fullText: String, keywords: List<String>): String {
+        val lower = fullText.lowercase(Locale.ROOT)
         for (kw in keywords) {
-            val idx = fullText.lowercase(Locale.ROOT).indexOf(kw)
+            val idx = lower.indexOf(kw)
             if (idx != -1) {
-                val sub = fullText.substring(idx).take(80)
-                return sub.split(".", "\n", "!").firstOrNull()?.trim() ?: sub.trim()
+                val before = if (idx > 0) fullText.substring(0, idx).takeLast(120) else ""
+                val sub = fullText.substring(idx).take(220)
+                val clause = sub.split('.', '\n', '!', '?').firstOrNull()?.trim().orEmpty()
+                return if (clause.isNotBlank()) clause else (before + " " + sub).trim()
             }
         }
         return ""

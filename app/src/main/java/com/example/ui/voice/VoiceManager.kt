@@ -34,13 +34,14 @@ class VoiceManager(
     private var textToSpeech: TextToSpeech? = null
     private var isTtsInitialized = false
     private var isListening = false
+    private var manualRestartCount = 0
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val silenceTimeoutRunnable = Runnable {
         Log.d("VoiceManager", "Backup silence timeout triggered.")
         stopListening()
     }
-    private val SILENCE_TIMEOUT_MS = 20000L
+    private val SILENCE_TIMEOUT_MS = 45000L
     private val RMS_THRESHOLD = 0.0f // Initial baseline fallback threshold
 
     // User-controlled or dynamic amplitude threshold for silence detection
@@ -286,6 +287,18 @@ class VoiceManager(
 
                         override fun onError(error: Int) {
                             cancelSilenceTimer()
+                            // Some Android recognizers end a session after a brief no-speech window.
+                            // Give manual chat input a small number of transparent retries instead of
+                            // making the microphone feel like it randomly shuts off.
+                            if (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT && isListening && manualRestartCount < 2) {
+                                manualRestartCount++
+                                isListening = false
+                                mainHandler.postDelayed({
+                                    if (!isListening) startListeningInternal(resetRetry = false)
+                                }, 250L)
+                                return
+                            }
+                            manualRestartCount = 0
                             val errorMessage = when (error) {
                                 SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
                                 SpeechRecognizer.ERROR_CLIENT -> "Client-side error"
@@ -392,6 +405,10 @@ class VoiceManager(
     }
 
     fun startListening() {
+        startListeningInternal(resetRetry = true)
+    }
+
+    private fun startListeningInternal(resetRetry: Boolean) {
         if (isListening) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             onErrorSpeech("Microphone permission not granted")
@@ -415,6 +432,7 @@ class VoiceManager(
                 noiseFloorSum = 0f
                 noiseSampleCount = 0
 
+                if (resetRetry) manualRestartCount = 0
                 recognizer.startListening(intent)
                 isListening = true
                 resetSilenceTimer()
@@ -441,6 +459,7 @@ class VoiceManager(
     }
 
     fun cancelListening() {
+        manualRestartCount = 99
         if (!isListening) return
         cancelSilenceTimer()
         try {

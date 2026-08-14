@@ -9,6 +9,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -17,7 +18,7 @@ object GeminiFileUploader {
     private const val BASE_URL = "https://generativelanguage.googleapis.com/"
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(45, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
         .writeTimeout(180, TimeUnit.SECONDS)
         .build()
@@ -31,10 +32,30 @@ object GeminiFileUploader {
         mimeType: String,
         displayName: String
     ): UploadedFile {
-        if (apiKey.isBlank()) throw IOException("Gemini API key is missing")
-
         val resolver = context.contentResolver
         val size = querySize(resolver, uri)
+        val streamProvider = { resolver.openInputStream(uri) ?: throw IOException("Unable to open selected file") }
+        return uploadStream(apiKey, mimeType, displayName, size, streamProvider)
+    }
+
+    suspend fun uploadFile(
+        file: File,
+        apiKey: String,
+        mimeType: String,
+        displayName: String = file.name
+    ): UploadedFile {
+        if (!file.exists()) throw IOException("Extracted attachment no longer exists: ${file.name}")
+        return uploadStream(apiKey, mimeType, displayName, file.length()) { file.inputStream() }
+    }
+
+    private suspend fun uploadStream(
+        apiKey: String,
+        mimeType: String,
+        displayName: String,
+        size: Long,
+        streamProvider: () -> java.io.InputStream
+    ): UploadedFile {
+        if (apiKey.isBlank()) throw IOException("Gemini API key is missing")
         val metadata = "{\"file\":{\"display_name\":${JSONObject.quote(displayName)}}}"
 
         val startRequest = Request.Builder()
@@ -48,20 +69,17 @@ object GeminiFileUploader {
             .build()
 
         val uploadUrl = client.newCall(startRequest).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("Gemini upload initialization failed: HTTP ${response.code}")
-            }
+            if (!response.isSuccessful) throw IOException("Gemini upload initialization failed: HTTP ${response.code}")
             response.header("X-Goog-Upload-URL")
                 ?: response.header("x-goog-upload-url")
                 ?: throw IOException("Gemini did not return an upload URL")
         }
 
-        val stream = resolver.openInputStream(uri) ?: throw IOException("Unable to open selected file")
         val body = object : RequestBody() {
             override fun contentType() = mimeType.toMediaType()
             override fun contentLength() = size
             override fun writeTo(sink: okio.BufferedSink) {
-                stream.use { input ->
+                streamProvider().use { input ->
                     val buffer = ByteArray(32 * 1024)
                     while (true) {
                         val count = input.read(buffer)
@@ -96,7 +114,7 @@ object GeminiFileUploader {
 
             val statusJson = client.newCall(statusRequest).execute().use { response ->
                 val text = response.body?.string().orEmpty()
-                if (!response.isSuccessful) throw IOException("Gemini file status failed: HTTP ${response.code}: $text")
+                if (!response.isSuccessful) throw IOException("Gemini file status failed: HTTP ${response.code}")
                 JSONObject(text)
             }
 
@@ -104,16 +122,11 @@ object GeminiFileUploader {
             val state = file.optJSONObject("state")?.optString("name") ?: file.optString("state")
             if (state.equals("ACTIVE", ignoreCase = true)) {
                 val fileUri = file.optString("uri")
-                if (fileUri.isNotBlank()) {
-                    return UploadedFile(fileUri, file.optString("mimeType").ifBlank { mimeType })
-                }
+                if (fileUri.isNotBlank()) return UploadedFile(fileUri, file.optString("mimeType").ifBlank { mimeType })
             }
-            if (state.equals("FAILED", ignoreCase = true)) {
-                throw IOException("Gemini could not process $displayName")
-            }
+            if (state.equals("FAILED", ignoreCase = true)) throw IOException("Gemini could not process $displayName")
             delay(1000)
         }
-
         throw IOException("Gemini file processing timed out for $displayName")
     }
 
@@ -123,7 +136,5 @@ object GeminiFileUploader {
             val index = cursor.getColumnIndex(OpenableColumns.SIZE)
             if (index >= 0 && !cursor.isNull(index)) cursor.getLong(index) else -1L
         } ?: -1L
-    } catch (_: Exception) {
-        -1L
-    }
+    } catch (_: Exception) { -1L }
 }

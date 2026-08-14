@@ -47,6 +47,8 @@ import androidx.compose.foundation.lazy.LazyRow
 import com.example.data.model.Attachment
 import com.example.data.model.AttachmentHandler
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ChatScreen(
@@ -80,9 +82,9 @@ fun ChatScreen(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         uris.forEach { uri ->
-            val attachment = AttachmentHandler.processUri(context, uri)
-            if (attachment != null) {
-                viewModel.addAttachment(attachment)
+            coroutineScope.launch {
+                val attachment = withContext(Dispatchers.IO) { AttachmentHandler.processUri(context, uri) }
+                if (attachment != null) viewModel.addAttachment(attachment)
             }
         }
     }
@@ -591,7 +593,11 @@ fun ChatScreen(
                                         viewModel.sendMessage(inputText)
                                         inputText = ""
                                     } else {
-                                        viewModel.startListening()
+                                        if (assistantState == AssistantState.LISTENING) {
+                                            viewModel.cancelListening()
+                                        } else {
+                                            viewModel.startListening()
+                                        }
                                     }
                                 },
                                 modifier = Modifier
@@ -607,8 +613,12 @@ fun ChatScreen(
                                     .testTag("chat_send_button")
                             ) {
                                 Icon(
-                                    imageVector = if (inputText.trim().isNotEmpty() || pendingAttachments.isNotEmpty()) Icons.AutoMirrored.Filled.Send else Icons.Filled.Mic,
-                                    contentDescription = "Send",
+                                    imageVector = when {
+                                        inputText.trim().isNotEmpty() || pendingAttachments.isNotEmpty() -> Icons.AutoMirrored.Filled.Send
+                                        assistantState == AssistantState.LISTENING -> Icons.Filled.Stop
+                                        else -> Icons.Filled.Mic
+                                    },
+                                    contentDescription = if (assistantState == AssistantState.LISTENING) "Stop listening" else "Send",
                                     tint = Color.White,
                                     modifier = Modifier.size(20.dp)
                                 )

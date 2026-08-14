@@ -108,15 +108,23 @@ class BabyRepository(
     }
 
     suspend fun addMemory(content: String, type: String, importance: Int = 3, embedding: String? = null): Long = withContext(Dispatchers.IO) {
+        val normalized = content.trim().replace(Regex("\\s+"), " ")
+        if (normalized.isBlank()) return@withContext -1L
+        val existingId = memoryDao.findExactId(normalized)
+        if (existingId != null) return@withContext existingId
         val memory = MemoryEntity(
-            content = content,
+            content = normalized,
             type = type,
-            importance = importance,
+            importance = importance.coerceIn(1, 5),
             embedding = embedding
         )
         val id = memoryDao.insertMemory(memory)
-        addLog("Memory", "Saved memory ($type) with ID $id: \"$content\"${if (embedding != null) " (with semantic embedding)" else ""}")
+        addLog("Memory", "Saved memory ($type) with ID $id: \"$normalized\"${if (embedding != null) " (with semantic embedding)" else ""}")
         id
+    }
+
+    suspend fun getRecentImportantMemories(limit: Int = 20): List<MemoryEntity> = withContext(Dispatchers.IO) {
+        memoryDao.getRecentImportantMemories(limit)
     }
 
     suspend fun deleteMemory(id: Long) = withContext(Dispatchers.IO) {
@@ -134,8 +142,8 @@ class BabyRepository(
         addLog("Memory", "Cleared all long-term memories")
     }
 
-    suspend fun searchMemories(query: String): List<MemoryEntity> = withContext(Dispatchers.IO) {
-        memoryDao.searchMemories(query)
+    suspend fun searchMemories(query: String, limit: Int = 20): List<MemoryEntity> = withContext(Dispatchers.IO) {
+        memoryDao.searchMemories(query, limit)
     }
 
     suspend fun getSetting(key: String, defaultValue: String): String = withContext(Dispatchers.IO) {

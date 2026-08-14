@@ -64,6 +64,9 @@ class BabyViewModel(
     private val _rmsDb = MutableStateFlow(0.0f)
     val rmsDb: StateFlow<Float> = _rmsDb.asStateFlow()
 
+    private val _moodSignal = MutableStateFlow(MoodSignal(UserEmotion.NEUTRAL, 0.0f, "warm"))
+    val moodSignal: StateFlow<MoodSignal> = _moodSignal.asStateFlow()
+
     private val _partialSpeechText = MutableStateFlow("")
     val partialSpeechText: StateFlow<String> = _partialSpeechText.asStateFlow()
 
@@ -116,7 +119,7 @@ class BabyViewModel(
     private val _apiKey = MutableStateFlow("")
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
-    private val _geminiModel = MutableStateFlow("gemini-3.5-flash")
+    private val _geminiModel = MutableStateFlow("gemini-3.6-flash")
     val geminiModel: StateFlow<String> = _geminiModel.asStateFlow()
 
     private val _voicePitch = MutableStateFlow(1.0f)
@@ -249,7 +252,7 @@ class BabyViewModel(
         // Load initial settings from DB
         viewModelScope.launch {
             _apiKey.value = repository.getSetting("api_key", "")
-            _geminiModel.value = repository.getSetting("gemini_model", "gemini-3.5-flash")
+            _geminiModel.value = repository.getSetting("gemini_model", "gemini-3.6-flash")
             _voicePitch.value = repository.getSetting("voice_pitch", "1.0").toFloatOrNull() ?: 1.0f
             _voiceRate.value = repository.getSetting("voice_rate", "1.0").toFloatOrNull() ?: 1.0f
             _voiceStyle.value = repository.getSetting("voice_style", "default")
@@ -312,9 +315,11 @@ class BabyViewModel(
             context = application,
             onPartialSpeech = { text ->
                 _partialSpeechText.value = text
+                _moodSignal.value = MoodRadar.detect(text, _rmsDb.value)
             },
             onFinalSpeech = { text ->
                 _partialSpeechText.value = ""
+                _moodSignal.value = MoodRadar.detect(text, _rmsDb.value)
                 viewModelScope.launch {
                     sendMessage(text)
                 }
@@ -328,6 +333,8 @@ class BabyViewModel(
             },
             onRmsChanged = { rms ->
                 _rmsDb.value = rms
+                val current = _partialSpeechText.value
+                if (current.isNotBlank()) _moodSignal.value = MoodRadar.detect(current, rms)
             },
             onListeningStateChanged = { listening ->
                 if (listening) {
@@ -570,6 +577,17 @@ class BabyViewModel(
 
                 finalPrompt = if (!isRegeneration) {
                     repository.addMessage(convId, "user", displayPrompt)
+                    // Infinite-memory drive: preserve the user's complete text as a searchable conversation detail.
+                    if (content.trim().isNotEmpty()) {
+                        repository.addMemory(
+                            content = "Conversation detail: ${content.trim().take(4000)}",
+                            type = "CONVERSATION_DETAIL",
+                            importance = 1
+                        )
+                        RelationshipMemoryExtractor.extractRelationshipFacts(content).forEach { (fact, type) ->
+                            repository.addMemory(fact, type, if (type == "IMPORTANT") 5 else 4)
+                        }
+                    }
                     content
                 } else {
                     activeMessages.value.lastOrNull { it.role == "user" }?.content ?: content
@@ -607,15 +625,21 @@ class BabyViewModel(
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 repository.addLog("AI", "Generation job cancelled/interrupted.")
+                throw e
             } catch (e: Exception) {
                 repository.addLog("AI_Error", "Failed to generate online AI response: ${e.message}. Using offline companion logic.")
                 val detectedEmotion = EmotionDetector.detectEmotion(finalPrompt)
                 val offlineText = OfflineCompanionEngine.generateOfflineResponse(
                     prompt = finalPrompt,
-                    memories = memories.value,
+                    memories = memories.value.take(18),
                     emotion = detectedEmotion
                 )
                 simulateStreamingText(offlineText, convId)
+            } finally {
+                // ZIP media is materialized only for the current request; remove it after the request finishes.
+                attachments.flatMap { it.extractedMedia }.forEach { media ->
+                    runCatching { media.file.delete() }
+                }
             }
         }
     }
@@ -634,15 +658,16 @@ class BabyViewModel(
                 _streamingMessageText.value = sb.toString()
 
                 // Adaptive delay simulating natural typing speed
-                val delayMs = (words[i].length * 12L).coerceIn(30L, 100L)
-                delay(delayMs)
+                // The API response has already arrived. Keep the visual stream fast instead of adding seconds of artificial latency.
+                val delayMs = (words[i].length * 1L).coerceIn(0L, 8L)
+                if (delayMs > 0) delay(delayMs)
             }
 
             val savedText = _streamingMessageText.value ?: ""
             if (savedText.isNotEmpty()) {
                 repository.addMessage(convId, "assistant", savedText)
                 speak(savedText)
-                extractMemoryInBackground(words.joinToString(" ").take(150), savedText)
+                extractMemoryInBackground(savedText.take(4000), savedText)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             val partialText = _streamingMessageText.value ?: ""
@@ -676,14 +701,23 @@ class BabyViewModel(
 
         repository.addLog("AI_Call", "Calling Gemini API with ${attachments.size} attachments...")
 
-        val maxMemories = if (_isPowerSaveActive.value) 2 else 6
-        val semanticResults = retrieveSemanticMemories(prompt, limit = maxMemories)
+        // Fast local memory retrieval: avoid an extra network embedding round-trip on every chat message.
+        // Existing embeddings are still generated in the background and can be used later for offline ranking.
+        val maxMemories = if (_isPowerSaveActive.value) 4 else 10
+        val keywordMemories = repository.searchMemories(prompt, maxMemories)
+        val importantMemories = repository.getRecentImportantMemories(if (_isPowerSaveActive.value) 4 else 10)
+        val selectedMemories = (keywordMemories + importantMemories)
+            .distinctBy { it.content }
+            .sortedWith(compareByDescending<MemoryEntity> { it.importance }.thenByDescending { it.timestamp })
+            .take(18)
 
-        val memoryContext = if (semanticResults.isNotEmpty()) {
-            "Relevant user memories to remember:\n" + semanticResults.joinToString("\n") { "- ${it.first.content} (similarity score: ${"%.2f".format(it.second)})" } + "\n\n"
+        val memoryContext = if (selectedMemories.isNotEmpty()) {
+            "Relevant user memories to remember:\n" + selectedMemories.joinToString("\n") { "- ${it.content}" } + "\n\n"
         } else ""
 
-        val memoryList = memories.value
+        val memoryList = selectedMemories
+        val currentMood = MoodRadar.detect(prompt, _rmsDb.value)
+        _moodSignal.value = currentMood
 
         val isPowerSave = _isPowerSaveActive.value
         val isDeepThinking = _thinkingMode.value == "deep"
@@ -692,7 +726,8 @@ class BabyViewModel(
             memories = memoryList,
             detectedEmotion = detectedEmotion,
             isPowerSave = isPowerSave,
-            isDeepThinking = isDeepThinking
+            isDeepThinking = isDeepThinking,
+            moodSignal = currentMood
         )
 
         val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
@@ -718,14 +753,7 @@ class BabyViewModel(
         var docContext = ""
         attachments.forEach { att ->
             if (!att.base64Data.isNullOrEmpty()) {
-                partsList.add(
-                    GeminiPart(
-                        inlineData = GeminiInlineData(
-                            mimeType = att.mimeType,
-                            data = att.base64Data
-                        )
-                    )
-                )
+                partsList.add(GeminiPart(inlineData = GeminiInlineData(mimeType = att.mimeType, data = att.base64Data)))
             } else if (att.isGeminiMedia) {
                 try {
                     val uploaded = GeminiFileUploader.upload(
@@ -735,14 +763,7 @@ class BabyViewModel(
                         mimeType = att.mimeType,
                         displayName = att.name
                     )
-                    partsList.add(
-                        GeminiPart(
-                            fileData = GeminiFileData(
-                                mimeType = uploaded.mimeType,
-                                fileUri = uploaded.uri
-                            )
-                        )
-                    )
+                    partsList.add(GeminiPart(fileData = GeminiFileData(mimeType = uploaded.mimeType, fileUri = uploaded.uri)))
                 } catch (e: Exception) {
                     docContext += "\n[Attached media: ${att.name}]\nUpload failed: ${e.message ?: "unknown error"}.\n"
                 }
@@ -750,6 +771,21 @@ class BabyViewModel(
 
             if (!att.extractedText.isNullOrBlank()) {
                 docContext += "\n[Attached file: ${att.name}]\n${att.extractedText}\n"
+            }
+
+            // ZIPs can contain their own images, videos, PDFs, spreadsheets and presentations.
+            att.extractedMedia.forEach { media ->
+                try {
+                    val uploaded = GeminiFileUploader.uploadFile(
+                        file = media.file,
+                        apiKey = resolvedKey,
+                        mimeType = media.mimeType,
+                        displayName = "${att.name} / ${media.name}"
+                    )
+                    partsList.add(GeminiPart(fileData = GeminiFileData(mimeType = uploaded.mimeType, fileUri = uploaded.uri)))
+                } catch (e: Exception) {
+                    docContext += "\n[ZIP binary entry: ${media.name}]\nUpload failed: ${e.message ?: "unknown error"}.\n"
+                }
             }
         }
 
@@ -772,7 +808,7 @@ class BabyViewModel(
             generationConfig = generationConfig
         )
 
-        val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.5-flash" }
+        val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.6-flash" }
 
         val apiResponse = callGeminiWithExponentialBackoff(
             model = modelToUse,
@@ -791,24 +827,9 @@ class BabyViewModel(
     private fun String.toEmbeddingList(): List<Float> = split(",").mapNotNull { it.toFloatOrNull() }
 
     private suspend fun fetchEmbedding(text: String): List<Float>? = withContext(Dispatchers.IO) {
-        val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
-        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
-            return@withContext null
-        }
-        try {
-            val request = com.example.data.api.GeminiEmbeddingRequest(
-                content = GeminiContent(parts = listOf(GeminiPart(text = text)))
-            )
-            val response = ApiClients.geminiService.embedContent(
-                model = "text-embedding-004",
-                apiKey = resolvedKey,
-                request = request
-            )
-            response.embedding?.values
-        } catch (e: Exception) {
-            Log.e("BabyViewModel", "Failed to fetch embedding: ${e.message}")
-            null
-        }
+        // The legacy text-embedding-004 model was shut down. Memory retrieval is now local-first,
+        // so a dead embedding endpoint can never slow or break normal chat.
+        null
     }
 
     private fun cosineSimilarity(vectorA: List<Float>, vectorB: List<Float>): Float {
@@ -854,27 +875,7 @@ class BabyViewModel(
     }
 
     private fun initializeMemoriesWithEmbeddings() {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                delay(3000) // Wait for initialization to settle
-                val allMemories = memories.value
-                val missingEmbeddings = allMemories.filter { it.embedding.isNullOrEmpty() }
-                if (missingEmbeddings.isNotEmpty()) {
-                    repository.addLog("Memory", "Vector Database: Found ${missingEmbeddings.size} memories missing embeddings. Processing...")
-                    missingEmbeddings.forEach { memory ->
-                        val vector = fetchEmbedding(memory.content)
-                        if (vector != null) {
-                            val updatedMemory = memory.copy(embedding = vector.toEmbeddingString())
-                            repository.updateMemory(updatedMemory)
-                        }
-                        delay(1000) // rate limit guard
-                    }
-                    repository.addLog("Memory", "Vector Database: Semantic indexing completed.")
-                }
-            } catch (e: Exception) {
-                Log.e("BabyViewModel", "Failed to batch embed existing memories: ${e.message}", e)
-            }
-        }
+        // Intentionally local-first. Existing memory records remain fully searchable without a network embedding call.
     }
 
     // --- Automatic Long-Term Memory Extraction ---
@@ -890,35 +891,33 @@ class BabyViewModel(
                 // 1. Local Regex Relationship Fact Extraction
                 val localFacts = RelationshipMemoryExtractor.extractRelationshipFacts(userMsg)
                 localFacts.forEach { (factText, factType) ->
-                    val vectorStr = fetchEmbedding(factText)?.toEmbeddingString()
-                    repository.addMemory(factText, factType, 5, vectorStr)
+                    repository.addMemory(factText, factType, if (factType == "IMPORTANT") 5 else 4)
                 }
 
                 // 2. Online Deep Fact Extraction via Gemini if Key is Present
                 val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
                 if (resolvedKey.isNotEmpty() && resolvedKey != "MY_GEMINI_API_KEY") {
-                    val memoryPrompt = "Analyze the following message turn. " +
-                            "If the user shares an important fact, preference, preference rating, dog name, habit, or specific details about themselves, extract it into a 1-sentence statement starting with 'User...'. " +
-                            "If there is no personal info shared, return 'NONE'.\n\n" +
-                            "User: $userMsg\n" +
-                            "Assistant: $assistantMsg\n\n" +
-                            "Output Statement:"
+                    val memoryPrompt = "Analyze this conversation turn for durable user memory. Extract every useful personal detail, preference, routine, goal, relationship detail, favorite item, explicit remember-this request, or stable fact. Return one concise memory per line, each beginning with 'User:'. Do not invent anything. If nothing durable is present, return NONE.\n\nUser: $userMsg\nAssistant: $assistantMsg\n\nMemories:"
 
                     val request = GeminiRequest(
                         contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = memoryPrompt))))
                     )
 
                     val response = ApiClients.geminiService.generateContent(
-                        model = "gemini-3.5-flash",
+                        model = "gemini-3.5-flash-lite",
                         apiKey = resolvedKey,
                         request = request
                     )
 
                     val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text?.trim()
-                    if (!text.isNullOrEmpty() && !text.contains("NONE", ignoreCase = true)) {
-                        val finalMemoryText = text.replace("Statement:", "").trim()
-                        val embeddingStr = fetchEmbedding(finalMemoryText)?.toEmbeddingString()
-                        repository.addMemory(finalMemoryText, "FACT", 4, embeddingStr)
+                    if (!text.isNullOrEmpty() && !text.equals("NONE", ignoreCase = true)) {
+                        text.lines()
+                            .map { it.trim().removePrefix("-").trim() }
+                            .filter { it.isNotBlank() && !it.equals("NONE", ignoreCase = true) }
+                            .take(12)
+                            .forEach { line ->
+                                repository.addMemory(line.removePrefix("User:").trim(), "FACT", 4)
+                            }
                     }
                 }
             } catch (e: Exception) {
@@ -944,7 +943,23 @@ class BabyViewModel(
     }
 
     fun speak(text: String) {
-        voiceManager?.speak(text, rate = _voiceRate.value, pitch = _voicePitch.value)
+        val mood = _moodSignal.value
+        val rateMultiplier = when (mood.style) {
+            "cozy-whisper" -> 0.86f
+            "calm-grounding" -> 0.92f
+            "energetic" -> 1.10f
+            else -> 1.0f
+        }
+        val pitchMultiplier = when (mood.style) {
+            "cozy-whisper" -> 0.96f
+            "energetic" -> 1.04f
+            else -> 1.0f
+        }
+        voiceManager?.speak(
+            text,
+            rate = (_voiceRate.value * rateMultiplier).coerceIn(0.65f, 1.35f),
+            pitch = (_voicePitch.value * pitchMultiplier).coerceIn(0.75f, 1.25f)
+        )
     }
 
     fun stopSpeaking() {
@@ -1193,7 +1208,7 @@ suspend fun callOnlineAIWrapper(
         systemInstruction = systemInstruction
     )
 
-    val modelToUse = repository?.getSetting("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
+    val modelToUse = repository?.getSetting("gemini_model", "gemini-3.6-flash") ?: "gemini-3.6-flash"
 
     val apiResponse = callGeminiWithExponentialBackoff(
         model = modelToUse,

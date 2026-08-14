@@ -143,15 +143,14 @@ fun SettingsScreen(
                         Text("Gemini Model", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
 
                         val availableModels = listOf(
-                            "gemini-3.5-flash" to "Gemini 3.5 Flash (Recommended)",
-                            "gemini-3.1-pro-preview" to "Gemini 3.1 Pro (Deep Reasoning)",
-                            "gemini-3.1-flash-lite-preview" to "Gemini 3.1 Flash Lite (Ultra Fast)",
-                            "gemini-2.5-flash" to "Gemini 2.5 Flash",
-                            "gemini-flash-latest" to "Gemini Flash Latest"
+                            "gemini-3.6-flash" to "Gemini 3.6 Flash (Recommended - Fast)",
+                            "gemini-3.5-flash" to "Gemini 3.5 Flash (High Intelligence)",
+                            "gemini-3.5-flash-lite" to "Gemini 3.5 Flash-Lite (Ultra Fast)",
+                            "gemini-2.5-flash" to "Gemini 2.5 Flash (Stable)"
                         )
 
                         var expandedModelDropdown by remember { mutableStateOf(false) }
-                        val currentSelectedModelLabel = availableModels.find { it.first == geminiModel }?.second ?: geminiModel.ifEmpty { "Gemini 3.5 Flash (Recommended)" }
+                        val currentSelectedModelLabel = availableModels.find { it.first == geminiModel }?.second ?: geminiModel.ifEmpty { "Gemini 3.6 Flash (Recommended - Fast)" }
 
                         Box {
                             OutlinedButton(

@@ -51,8 +51,14 @@ interface MemoryDao {
     @Query("SELECT * FROM memories ORDER BY timestamp DESC")
     fun getAllMemories(): Flow<List<MemoryEntity>>
 
-    @Query("SELECT * FROM memories WHERE content LIKE '%' || :query || '%' ORDER BY timestamp DESC")
-    suspend fun searchMemories(query: String): List<MemoryEntity>
+    @Query("SELECT * FROM memories WHERE content LIKE '%' || :query || '%' ORDER BY importance DESC, timestamp DESC LIMIT :limit")
+    suspend fun searchMemories(query: String, limit: Int = 20): List<MemoryEntity>
+
+    @Query("SELECT * FROM memories ORDER BY importance DESC, timestamp DESC LIMIT :limit")
+    suspend fun getRecentImportantMemories(limit: Int = 20): List<MemoryEntity>
+
+    @Query("SELECT id FROM memories WHERE content = :content LIMIT 1")
+    suspend fun findExactId(content: String): Long?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMemory(memory: MemoryEntity): Long
