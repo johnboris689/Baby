@@ -58,6 +58,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private var isListening = false
     private var isContinuousConversation = false
     private var isProcessingCommand = false
+    private var commandRetryCount = 0
 
     // Single stable AudioRecord for passive wake-word detection
     private var audioRecord: AudioRecord? = null
@@ -74,8 +75,8 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     // Setting values
     private var wakeWordEnabled = true
     private var wakePhrases = setOf("hey baby", "hi baby", "hello baby")
-    private var wakeWordConfidenceThreshold = 0.75f
-    private var minSpeechThreshold = 2200.0f // Minimum RMS amplitude for VAD
+    private var wakeWordConfidenceThreshold = 0.68f
+    private var minSpeechThreshold = 900.0f // Minimum RMS amplitude for VAD
 
     // Debounce & false activation suppression tracking
     private var lastTriggerTimeMs = 0L
@@ -168,8 +169,8 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             val repo = repository ?: return@launch
             wakeWordEnabled = repo.getSetting("wake_word_enabled", "true").toBoolean()
             isContinuousConversation = repo.getSetting("is_continuous_mode", "false").toBoolean()
-            wakeWordConfidenceThreshold = repo.getSetting("wake_word_confidence_threshold", "0.75").toFloatOrNull() ?: 0.75f
-            minSpeechThreshold = (repo.getSetting("min_speech_threshold", "1600.0").toFloatOrNull() ?: 1600.0f).coerceIn(900.0f, 5000.0f)
+            wakeWordConfidenceThreshold = (repo.getSetting("wake_word_confidence_threshold", "0.68").toFloatOrNull() ?: 0.68f).coerceIn(0.55f, 0.90f)
+            minSpeechThreshold = (repo.getSetting("min_speech_threshold", "900.0").toFloatOrNull() ?: 900.0f).coerceIn(500.0f, 3500.0f)
 
             // Phrases settings
             val list = mutableSetOf<String>()
@@ -248,30 +249,39 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
                     override fun onError(error: Int) {
                         isListening = false
-                        Log.e(tag, "Command SpeechRecognizer Error: $error")
-                        if (isProcessingCommand) {
-                            isProcessingCommand = false
-                            if (wakeWordEnabled) {
-                                scope.launch {
-                                    delay(1000)
-                                    startPassiveWakeWordListening()
-                                }
+                        Log.w(tag, "Command SpeechRecognizer Error: $error")
+                        val retryable = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                            error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                            error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                            error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+                        if (isProcessingCommand && retryable && commandRetryCount < 3) {
+                            commandRetryCount++
+                            scope.launch {
+                                delay(350L)
+                                if (isProcessingCommand) startCommandListening()
                             }
+                        } else if (isProcessingCommand) {
+                            commandRetryCount = 0
+                            isProcessingCommand = false
+                            if (wakeWordEnabled) startPassiveWakeWordListening()
                         }
                     }
 
                     override fun onResults(results: Bundle?) {
                         isListening = false
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        if (!matches.isNullOrEmpty()) {
+                        if (!matches.isNullOrEmpty() && matches[0].trim().isNotEmpty()) {
+                            commandRetryCount = 0
                             val text = matches[0].trim().lowercase(Locale.ROOT)
                             Log.d(tag, "Command speech result: $text")
                             handleCommandSpeechResult(text)
+                        } else if (isProcessingCommand && commandRetryCount < 3) {
+                            commandRetryCount++
+                            scope.launch { delay(300L); if (isProcessingCommand) startCommandListening() }
                         } else {
+                            commandRetryCount = 0
                             isProcessingCommand = false
-                            if (wakeWordEnabled) {
-                                startPassiveWakeWordListening()
-                            }
+                            if (wakeWordEnabled) startPassiveWakeWordListening()
                         }
                     }
 
@@ -353,18 +363,18 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     val rms = Math.sqrt(sumSquare / readSize).toFloat()
 
                     // Calibrate over a longer quiet window so a single sound cannot become the noise floor.
-                    if (noiseSampleCount < 40) {
+                    if (noiseSampleCount < 25) {
                         noiseFloorSum += rms
                         noiseSampleCount++
-                        if (noiseSampleCount == 40) {
-                            estimatedNoiseFloor = (noiseFloorSum / 40.0).coerceIn(30.0, 4000.0)
+                        if (noiseSampleCount == 25) {
+                            estimatedNoiseFloor = (noiseFloorSum / 25.0).coerceIn(20.0, 2500.0)
                             Log.d(tag, "Estimated ambient noise floor: $estimatedNoiseFloor")
                         }
                         continue
                     }
 
                     // Require meaningful energy above both the configured floor and ambient noise.
-                    val dynamicThreshold = maxOf(minSpeechThreshold.toDouble(), estimatedNoiseFloor * 2.6).toFloat()
+                    val dynamicThreshold = maxOf(minSpeechThreshold.toDouble(), estimatedNoiseFloor * 1.65).toFloat()
                     if (rms < dynamicThreshold) {
                         consecutiveSpeechFrames = 0
                         continue
@@ -372,7 +382,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
                     consecutiveSpeechFrames++
                     // ~800ms of sustained speech before opening a recognition session.
-                    if (consecutiveSpeechFrames < 8) continue
+                    if (consecutiveSpeechFrames < 3) continue
                     consecutiveSpeechFrames = 0
 
                     val now = System.currentTimeMillis()
@@ -383,7 +393,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                             evaluateSpeechCandidate(rms)
                         }
                     }
-                    delay(1500)
+                    delay(500)
                 }
             } catch (e: Exception) {
                 if (generation == passiveGeneration) {
@@ -420,10 +430,13 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
 
         var tempRecognizer: SpeechRecognizer? = null
+        var candidateHandled = false
         try {
             tempRecognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) SpeechRecognizer.createOnDeviceSpeechRecognizer(this) else SpeechRecognizer.createSpeechRecognizer(this)
             tempRecognizer.setRecognitionListener(object : RecognitionListener {
@@ -445,17 +458,31 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     tempRecognizer?.destroy()
 
-                    if (!matches.isNullOrEmpty()) {
+                    if (!candidateHandled && !matches.isNullOrEmpty()) {
+                        candidateHandled = true
                         val text = matches[0].trim().lowercase(Locale.ROOT)
                         processWakeWordCandidate(text, rms)
-                    } else {
+                    } else if (!candidateHandled) {
                         if (wakeWordEnabled && !isProcessingCommand) {
                             startPassiveWakeWordListening()
                         }
                     }
                 }
 
-                override fun onPartialResults(partialResults: Bundle?) {}
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
+                    if (!candidateHandled && partial.isNotBlank()) {
+                        var best = 0f
+                        for (phrase in wakePhrases) best = maxOf(best, calculateWakeWordConfidence(partial, phrase))
+                        if (best >= wakeWordConfidenceThreshold) {
+                            candidateHandled = true
+                            tempRecognizer?.cancel()
+                            tempRecognizer?.destroy()
+                            processWakeWordCandidate(partial, rms)
+                        }
+                    }
+                }
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
@@ -550,6 +577,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun triggerWakeActivation() {
         stopPassiveAudioRecord()
         isProcessingCommand = true
+        commandRetryCount = 0
 
         // Play activation tone ONCE when confidently activated
         try {
@@ -562,9 +590,13 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         updateNotificationText("BabyAI: Activated")
 
         scope.launch {
-            speak("Yes?")
-            delay(1000)
-            startCommandListening()
+            speak("Yes? How can I help?")
+            var waited = 0L
+            while (isSpeaking && waited < 3500L) {
+                delay(100L)
+                waited += 100L
+            }
+            if (isProcessingCommand) startCommandListening()
         }
     }
 
@@ -578,6 +610,10 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 900L)
         }
 
         try {
@@ -628,10 +664,10 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
             isProcessingCommand = false
             if (isContinuousConversation) {
-                delay(2000)
+                delay(600)
                 startCommandListening()
             } else if (wakeWordEnabled) {
-                delay(2000)
+                delay(500)
                 startPassiveWakeWordListening()
             }
             return
@@ -662,10 +698,10 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             updateNotificationText("BabyAI Background Assistant active")
             isProcessingCommand = false
             if (isContinuousConversation) {
-                delay(4000)
+                delay(600)
                 startCommandListening()
             } else if (wakeWordEnabled) {
-                delay(4000)
+                delay(500)
                 startPassiveWakeWordListening()
             }
         }

@@ -2,33 +2,64 @@ package com.example.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.Chat
-import androidx.compose.material.icons.outlined.Memory
-import androidx.compose.material.icons.outlined.Mic
-import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.ui.components.AnimatedOrb
+import com.example.R
+import com.example.ui.components.GlassCard
+import com.example.ui.components.NeonOrb
+import com.example.ui.theme.BabyBackground
+import com.example.ui.theme.BabyBlue
+import com.example.ui.theme.BabyCyan
+import com.example.ui.theme.BabyGreen
+import com.example.ui.theme.BabyMuted
+import com.example.ui.theme.BabyPink
+import com.example.ui.theme.BabyText
+import com.example.ui.theme.BabyViolet
 import com.example.ui.viewmodel.AssistantState
 import com.example.ui.viewmodel.BabyViewModel
 
@@ -41,303 +72,164 @@ fun HomeScreen(
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.assistantState.collectAsState()
-    val rmsDb by viewModel.rmsDb.collectAsState()
-    val partialText by viewModel.partialSpeechText.collectAsState()
-    val isContinuousMode by viewModel.isContinuousMode.collectAsState()
-    val isInternetAvailable by viewModel.isInternetAvailable.collectAsState()
+    val partial by viewModel.partialSpeechText.collectAsState()
+    val mood by viewModel.moodSignal.collectAsState()
+    val continuous by viewModel.isContinuousMode.collectAsState()
+    val backgroundVoice by viewModel.backgroundServiceEnabled.collectAsState()
+    val internet by viewModel.isInternetAvailable.collectAsState()
 
-    val primaryGradient = Brush.verticalGradient(
-        colors = listOf(
-            Color(0xFF0F172A), // Slate 900
-            Color(0xFF020617)  // Slate 950
-        )
-    )
+    val active = state != AssistantState.IDLE
+    val status = when (state) {
+        AssistantState.LISTENING -> "Listening"
+        AssistantState.THINKING -> "Thinking"
+        AssistantState.SPEAKING -> "Speaking"
+        AssistantState.IDLE -> if (backgroundVoice) "Listening in background" else "Ready"
+    }
 
-    Column(
+    Box(
         modifier = modifier
             .fillMaxSize()
-            .background(primaryGradient)
-            .padding(20.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        // --- Header Status Area ---
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column {
-                Text(
-                    text = "BABY",
-                    color = Color.White,
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 2.sp
+            .background(
+                Brush.radialGradient(
+                    colors = listOf(Color(0xFF0B1E3A), Color(0xFF050A15), BabyBackground),
+                    radius = 900f
                 )
-                Text(
-                    text = if (isInternetAvailable) "Gemini AI Connected" else "No Internet Connection",
-                    color = Color.White.copy(alpha = 0.5f),
-                    fontSize = 12.sp
-                )
-            }
-
-            // Connection indicator pill
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(
-                        if (isInternetAvailable) Color(0xFF10B981).copy(alpha = 0.15f) else Color(0xFFEF4444).copy(alpha = 0.15f)
-                    )
-                    .border(
-                        width = 1.dp,
-                        color = if (isInternetAvailable) Color(0xFF10B981) else Color(0xFFEF4444),
-                        shape = RoundedCornerShape(20.dp)
-                    )
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (isInternetAvailable) Color(0xFF10B981) else Color(0xFFEF4444)
-                            )
-                    )
-                    Text(
-                        text = if (isInternetAvailable) "Gemini Active" else "Offline",
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-            }
-        }
-
-        // --- Animated Orb and Mic transcription ---
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier.weight(1f)
-        ) {
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier.padding(bottom = 30.dp)
-            ) {
-                AnimatedOrb(state = state, rmsDb = rmsDb)
-
-                // Central state icon overlays on click
-                IconButton(
-                    onClick = {
-                        if (state == AssistantState.LISTENING) {
-                            viewModel.stopListening()
-                        } else if (state == AssistantState.SPEAKING) {
-                            viewModel.stopSpeaking()
-                        } else {
-                            viewModel.startListening()
-                        }
-                    },
-                    modifier = Modifier
-                        .size(80.dp)
-                        .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.03f))
-                        .testTag("orb_touch_target")
-                ) {
-                    Icon(
-                        imageVector = when (state) {
-                            AssistantState.LISTENING -> Icons.Filled.Stop
-                            AssistantState.THINKING -> Icons.Filled.HourglassEmpty
-                            AssistantState.SPEAKING -> Icons.Filled.VolumeMute
-                            AssistantState.IDLE -> Icons.Filled.Mic
-                        },
-                        contentDescription = "Interact",
-                        tint = Color.White.copy(alpha = 0.8f),
-                        modifier = Modifier.size(36.dp)
-                    )
-                }
-            }
-
-            // State label text
-            Text(
-                text = when (state) {
-                    AssistantState.IDLE -> "TAP TO SPEAK"
-                    AssistantState.LISTENING -> "LISTENING TO YOU..."
-                    AssistantState.THINKING -> "THINKING..."
-                    AssistantState.SPEAKING -> "SPEAKING RESPONSE..."
-                },
-                color = Color.White,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 1.5.sp,
-                textAlign = TextAlign.Center
             )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Live Speech Glassmorphic card
-            AnimatedVisibility(
-                visible = partialText.isNotEmpty() || state == AssistantState.LISTENING,
-                enter = fadeIn(),
-                exit = fadeOut()
+            .padding(horizontal = 18.dp, vertical = 12.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().navigationBarsPadding(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(0.9f)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color.White.copy(alpha = 0.05f))
-                        .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(16.dp))
-                        .padding(16.dp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Image(
+                        painter = painterResource(R.drawable.baby_icon),
+                        contentDescription = "Baby",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.size(48.dp).clip(CircleShape)
+                            .border(1.dp, BabyCyan.copy(alpha = .5f), CircleShape)
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text("Baby", color = BabyText, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(7.dp).clip(CircleShape).background(if (internet) BabyGreen else Color(0xFFF59E0B)))
+                            Spacer(Modifier.width(6.dp))
+                            Text(if (internet) "Online" else "Offline mode", color = BabyMuted, fontSize = 12.sp)
+                        }
+                    }
+                }
+                IconButton(onClick = onNavigateToSettings) {
+                    Icon(Icons.Filled.Settings, "Settings", tint = BabyText)
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            GlassCard(modifier = Modifier.fillMaxWidth().height(210.dp)) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
                 ) {
-                    Text(
-                        text = partialText.ifEmpty { "Say something, I'm listening..." },
-                        color = Color.White,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth()
+                    NeonOrb(active = active, modifier = Modifier.size(132.dp))
+                    Spacer(Modifier.height(10.dp))
+                    Text(status.uppercase(), color = BabyText, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+                    AnimatedVisibility(partial.isNotBlank(), enter = fadeIn()) {
+                        Text(partial, color = BabyCyan, fontSize = 13.sp, textAlign = TextAlign.Center, maxLines = 2)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            GlassCard(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Background voice", color = BabyText, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                        Text("Wake word: Hey Baby", color = BabyMuted, fontSize = 11.sp)
+                    }
+                    Switch(
+                        checked = backgroundVoice,
+                        onCheckedChange = viewModel::updateBackgroundServiceState,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = BabyBlue)
                     )
                 }
             }
-        }
 
-        // --- Bottom Navigation Toolbar & Controls ---
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(20.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            // Continuous listening toggle
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(30.dp))
-                    .background(Color.White.copy(alpha = 0.04f))
-                    .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(30.dp))
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            Spacer(Modifier.height(14.dp))
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                GlassStat("Memory", "∞", BabyViolet, Modifier.weight(1f))
+                GlassStat("Mood", mood.emotion.name.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }, BabyPink, Modifier.weight(1f))
+                GlassStat("Voice", if (continuous) "Live" else "Ready", BabyCyan, Modifier.weight(1f))
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Text("Quick Access", color = BabyMuted, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                item { QuickAction(Icons.Filled.ChatBubbleOutline, "Chat", onNavigateToChat) }
+                item { QuickAction(Icons.Filled.FolderOpen, "Files", onNavigateToChat) }
+                item { QuickAction(Icons.Filled.Memory, "Memory", onNavigateToMemory) }
+                item { QuickAction(Icons.Filled.Settings, "System", onNavigateToSettings) }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            IconButton(
+                onClick = {
+                    when (state) {
+                        AssistantState.LISTENING -> viewModel.stopListening()
+                        AssistantState.SPEAKING -> viewModel.stopSpeaking()
+                        else -> viewModel.startListening()
+                    }
+                },
+                modifier = Modifier.size(78.dp).clip(CircleShape).background(Brush.linearGradient(listOf(BabyBlue, BabyViolet, BabyPink)))
+                    .border(2.dp, Color.White.copy(alpha = .25f), CircleShape)
             ) {
                 Icon(
-                    imageVector = Icons.Filled.Hearing,
-                    contentDescription = null,
-                    tint = if (isContinuousMode) Color(0xFF10B981) else Color.White.copy(alpha = 0.4f),
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Continuous Voice Mode",
-                    color = Color.White.copy(alpha = 0.8f),
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Spacer(modifier = Modifier.width(16.dp))
-                Switch(
-                    checked = isContinuousMode,
-                    onCheckedChange = { viewModel.saveSetting("is_continuous_mode", it.toString()) },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color(0xFF10B981),
-                        checkedTrackColor = Color(0xFF10B981).copy(alpha = 0.3f),
-                        uncheckedThumbColor = Color.White.copy(alpha = 0.5f),
-                        uncheckedTrackColor = Color.White.copy(alpha = 0.1f)
-                    ),
-                    modifier = Modifier.scale(0.8f)
+                    when (state) {
+                        AssistantState.LISTENING -> Icons.Filled.Stop
+                        AssistantState.SPEAKING -> Icons.Filled.VolumeOff
+                        else -> Icons.Filled.Mic
+                    }, "Voice", tint = Color.White, modifier = Modifier.size(30.dp)
                 )
             }
-
-            // Quick Toolbar Buttons
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 10.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = onNavigateToChat,
-                    modifier = Modifier
-                        .size(54.dp)
-                        .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.05f))
-                        .testTag("toolbar_chat_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Chat,
-                        contentDescription = "Chat",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = {
-                        if (state == AssistantState.LISTENING) {
-                            viewModel.stopListening()
-                        } else {
-                            viewModel.startListening()
-                        }
-                    },
-                    modifier = Modifier
-                        .size(68.dp)
-                        .clip(CircleShape)
-                        .background(
-                            Brush.linearGradient(
-                                colors = listOf(Color(0xFF6366F1), Color(0xFFEC4899))
-                            )
-                        )
-                        .testTag("toolbar_mic_button")
-                ) {
-                    Icon(
-                        imageVector = if (state == AssistantState.LISTENING) Icons.Filled.Stop else Icons.Filled.Mic,
-                        contentDescription = "Microphone",
-                        tint = Color.White,
-                        modifier = Modifier.size(28.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = onNavigateToMemory,
-                    modifier = Modifier
-                        .size(54.dp)
-                        .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.05f))
-                        .testTag("toolbar_memory_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Memory,
-                        contentDescription = "Memory",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = onNavigateToSettings,
-                    modifier = Modifier
-                        .size(54.dp)
-                        .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.05f))
-                        .testTag("toolbar_settings_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Settings,
-                        contentDescription = "Settings",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-            }
+            Spacer(Modifier.height(10.dp))
+            Text("Tap to speak  •  Say “Hey Baby”", color = BabyMuted, fontSize = 11.sp)
+            Spacer(Modifier.height(8.dp))
         }
     }
 }
 
-// Extension function to scale the switch cleanly
-fun Modifier.scale(scale: Float): Modifier = this.then(
-    android.graphics.Matrix().let {
-        Modifier
+@Composable
+private fun GlassStat(title: String, value: String, accent: Color, modifier: Modifier) {
+    GlassCard(modifier = modifier) {
+        Column(Modifier.padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(value, color = accent, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(title, color = BabyMuted, fontSize = 10.sp)
+        }
     }
-)
+}
+
+@Composable
+private fun QuickAction(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, onClick: () -> Unit) {
+    GlassCard(modifier = Modifier.width(82.dp).height(72.dp).clickable(onClick = onClick)) {
+        Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(icon, null, tint = BabyCyan, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.height(5.dp))
+            Text(title, color = BabyText, fontSize = 10.sp)
+        }
+    }
+}

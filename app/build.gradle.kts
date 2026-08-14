@@ -2,19 +2,21 @@ plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
-  alias(libs.plugins.secrets)
 }
 
 android {
   namespace = "com.example"
   compileSdk = 36
 
+  val geminiKey = (providers.gradleProperty("GEMINI_API_KEY").orNull ?: System.getenv("GEMINI_API_KEY") ?: "").replace("\\", "\\\\").replace("\"", "\\\"")
+
   defaultConfig {
     applicationId = "com.aistudio.baby.qyptv"
     minSdk = 24
     targetSdk = 36
     versionCode = 1
-    versionName = "1.0"
+    versionName = "2.0"
+    buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
@@ -25,13 +27,17 @@ android {
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
     }
     debug {
-      // Use Android's standard debug signing. Never generate a keystore during configuration.
+      // Standard Android debug signing.
     }
   }
 
   compileOptions {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+  }
+
+  kotlinOptions {
+    jvmTarget = "21"
   }
 
   buildFeatures {
@@ -42,11 +48,6 @@ android {
   testOptions {
     unitTests { isIncludeAndroidResources = true }
   }
-}
-
-secrets {
-  propertiesFileName = ".env"
-  defaultPropertiesFileName = ".env.example"
 }
 
 dependencies {
@@ -90,6 +91,5 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
 
-  // Room is the only annotation processor required by this project.
   ksp(libs.androidx.room.compiler)
 }

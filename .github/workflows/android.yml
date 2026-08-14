@@ -38,7 +38,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '9.3.1'
-          validate-wrappers: true
+          validate-wrappers: false
 
       - name: Verify build inputs
         run: |

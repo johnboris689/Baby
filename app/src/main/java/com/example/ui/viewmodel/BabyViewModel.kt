@@ -44,6 +44,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class AssistantState {
     IDLE,
@@ -321,7 +322,15 @@ class BabyViewModel(
                 _partialSpeechText.value = ""
                 _moodSignal.value = MoodRadar.detect(text, _rmsDb.value)
                 viewModelScope.launch {
-                    sendMessage(text)
+                    val normalized = text.trim().lowercase()
+                    val wakeOnly = normalized.matches(Regex("(?:hey|hi|hello)\\s+baby[.!?]*")) || normalized == "baby"
+                    val stripped = normalized.replace(Regex("^(hey|hi|hello)\\s+baby\\s*[,!?.-]*\\s*"), "").trim()
+                    if (wakeOnly) {
+                        repository.addLog("Voice", "Wake phrase recognized from manual microphone: $text")
+                        speak("Yes? How can I help?")
+                    } else {
+                        sendMessage(if (stripped.isNotBlank()) stripped else text)
+                    }
                 }
             },
             onErrorSpeech = { err ->
@@ -618,9 +627,15 @@ class BabyViewModel(
                     mapOf("role" to it.role, "content" to it.content)
                 }
 
-                val responseText = callOnlineAI(finalPrompt, activeMsgHistory, attachments)
+                val responseText = withTimeoutOrNull(18_000L) {
+                    callOnlineAI(finalPrompt, activeMsgHistory, attachments)
+                } ?: OfflineCompanionEngine.generateOfflineResponse(
+                    prompt = finalPrompt,
+                    memories = memories.value.take(18),
+                    emotion = EmotionDetector.detectEmotion(finalPrompt)
+                )
 
-                // Simulate token-by-token response streaming
+                // Render the response immediately; do not add artificial typing latency.
                 simulateStreamingText(responseText, convId)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -1224,9 +1239,9 @@ suspend fun callGeminiWithExponentialBackoff(
     model: String,
     apiKey: String,
     request: GeminiRequest,
-    maxRetries: Int = 3
+    maxRetries: Int = 2
 ): GeminiResponse = withContext(Dispatchers.IO) {
-    var delayMs = 1000L
+    var delayMs = 350L
     for (attempt in 0 until maxRetries) {
         try {
             return@withContext ApiClients.geminiService.generateContent(

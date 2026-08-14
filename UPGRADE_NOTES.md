@@ -1,0 +1,21 @@
+# Baby — Glass UI / Voice Stability Upgrade
+
+## Included
+
+- Futuristic glassmorphism redesign for Home, Chat, Settings and Memory surfaces.
+- Manual speech input now owns the microphone exclusively and pauses the background listener.
+- SpeechRecognizer no longer closes the UI immediately at `onEndOfSpeech`; final results are allowed to arrive.
+- Speech timeout/no-match/busy errors retry automatically before showing an error.
+- `Hey Baby`, `Hi Baby`, and `Hello Baby` work without a custom phrase. Saying only a wake phrase manually produces an immediate acknowledgement.
+- Background wake-word VAD is less aggressive about microphone cycling and uses partial recognition to reduce wake latency.
+- Old background microphone generations cannot release a newer recorder.
+- Gemini calls have shorter network limits and a bounded 18-second online wait before offline companion fallback.
+- Artificial response typing latency remains removed.
+- Gradle wrapper JAR removed; CI installs Gradle 9.3.1 directly and disables wrapper validation because no wrapper is checked in.
+- AGP 9 built-in Kotlin + KSP2 compatibility is retained.
+- Gemini API key can be provided with the `GEMINI_API_KEY` Gradle property or environment variable, or entered in Baby settings.
+- ZIP/document/media attachment processing from the previous upgrade remains included.
+
+## CI
+
+GitHub Actions installs JDK 21, Android API 36/build-tools 36.0.0 and Gradle 9.3.1, then runs `gradle assembleDebug` and uploads `baby-app-debug-apk`.

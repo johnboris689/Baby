@@ -36,7 +36,6 @@ datastorePreferences = "1.1.7"
 robolectric = "4.16.1"
 roborazzi = "1.59.0"
 firebaseBom = "34.15.0"
-secretsGradlePlugin = "2.0.1"
 googleServices = "4.5.0"
 
 [libraries]
@@ -92,4 +91,3 @@ firebase-appcheck-recaptcha = { group = "com.google.firebase", name = "firebase-
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 google-devtools-ksp = { id = "com.google.devtools.ksp", version.ref = "googleDevtoolsKsp" }
-secrets = { id = "com.google.android.libraries.mapsplatform.secrets-gradle-plugin", version.ref = "secretsGradlePlugin" }

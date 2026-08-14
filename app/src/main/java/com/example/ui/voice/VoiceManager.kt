@@ -1,9 +1,11 @@
 package com.example.ui.voice
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
-import android.os.Bundle
+import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.RecognitionListener
@@ -12,12 +14,15 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import java.util.Locale
-import android.Manifest
-import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import java.io.File
+import java.util.Locale
 
+/**
+ * Manual voice input owns the microphone exclusively. Background wake-word listening
+ * is paused before a session and resumed only after the recognizer has completely ended.
+ * Speech timeout/no-match errors are retried instead of immediately closing the UI.
+ */
 class VoiceManager(
     private val context: Context,
     private val onPartialSpeech: (String) -> Unit,
@@ -30,337 +35,234 @@ class VoiceManager(
     private val onTtsInitialized: () -> Unit = {}
 ) : TextToSpeech.OnInitListener {
 
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var textToSpeech: TextToSpeech? = null
-    private var isTtsInitialized = false
-    private var isListening = false
-    private var manualRestartCount = 0
-
+    private val tag = "BabyVoice"
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val silenceTimeoutRunnable = Runnable {
-        Log.d("VoiceManager", "Backup silence timeout triggered.")
-        stopListening()
+    private var recognizer: SpeechRecognizer? = null
+    private var textToSpeech: TextToSpeech? = null
+    private var ttsReady = false
+    private var listening = false
+    private var retryCount = 0
+    private var sessionStartedAt = 0L
+    private var lastPartialAt = 0L
+    private var shuttingDown = false
+
+    private val MAX_SESSION_MS = 90_000L
+    private val MAX_RETRIES = 5
+    private val RETRY_DELAY_MS = 280L
+
+    private val sessionGuard = Runnable {
+        if (listening && System.currentTimeMillis() - sessionStartedAt >= MAX_SESSION_MS) {
+            Log.d(tag, "Manual voice session reached safety limit")
+            finishListening("Voice session timed out. Tap the mic to try again.", resume = true)
+        }
     }
-    private val SILENCE_TIMEOUT_MS = 45000L
-    private val RMS_THRESHOLD = 0.0f // Initial baseline fallback threshold
 
-    // User-controlled or dynamic amplitude threshold for silence detection
-    var amplitudeThreshold: Float = 0.0f
+    private val cacheCleanup = object : Runnable {
+        override fun run() {
+            clearSpeechCache()
+            if (!shuttingDown) mainHandler.postDelayed(this, if (isPowerSaveMode) 900_000L else 300_000L)
+        }
+    }
 
-    // Custom Selected Voice name
+    var amplitudeThreshold: Float = 0f
+    var isPowerSaveMode: Boolean = false
+        set(value) {
+            field = value
+            mainHandler.removeCallbacks(cacheCleanup)
+            mainHandler.postDelayed(cacheCleanup, if (value) 900_000L else 300_000L)
+        }
+
     var selectedVoiceName: String? = null
         set(value) {
             field = value
             applyVoice()
         }
 
-    private fun applyVoice() {
-        if (!isTtsInitialized) return
-        val tts = textToSpeech ?: return
-        selectedVoiceName?.let { name ->
-            try {
-                val voiceOpt = tts.voices?.firstOrNull { it.name == name }
-                if (voiceOpt != null) {
-                    tts.voice = voiceOpt
-                    Log.d("VoiceManager", "Successfully set TTS voice to: $name")
-                } else {
-                    Log.w("VoiceManager", "Voice not found or not loaded yet: $name")
-                }
-            } catch (e: Exception) {
-                Log.e("VoiceManager", "Error setting voice: ${e.message}")
-            }
-        }
-    }
-
-    fun getAvailableVoiceNames(): List<String> {
-        if (!isTtsInitialized) return emptyList()
-        return try {
-            val tts = textToSpeech ?: return emptyList()
-            val defaultLocale = Locale.getDefault()
-            val voices = tts.voices?.toList() ?: emptyList()
-
-            // Filter voices matching active locale language or English as a standard fallback
-            val filteredVoices = voices.filter { voice ->
-                voice.locale.language == defaultLocale.language || voice.locale.language == "en"
-            }
-            val voiceList = if (filteredVoices.isNotEmpty()) filteredVoices else voices
-            voiceList.map { it.name }.distinct().sorted()
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error getting available voice names: ${e.message}")
-            emptyList()
-        }
-    }
-
-    // Power save state support
-    var isPowerSaveMode: Boolean = false
-        set(value) {
-            if (field != value) {
-                field = value
-                Log.d("VoiceManager", "Power-save mode updated in VoiceManager: $value")
-                updateTaskFrequencies()
-            }
-        }
-
-    private val currentAmplitudeCheckInterval: Long
-        get() = if (isPowerSaveMode) 300L else 100L
-
-    private val currentCacheCleanupInterval: Long
-        get() = if (isPowerSaveMode) 900000L else 300000L // 15 mins vs 5 mins
-
-    private fun updateTaskFrequencies() {
-        if (isListening) {
-            stopAmplitudeMonitoring()
-            startAmplitudeMonitoring()
-        }
-        stopPeriodicCacheCleanup()
-        startPeriodicCacheCleanup()
-    }
-
-    // Real-time amplitude threshold monitor & dynamic noise calibration fields
-    private var lastActiveTimeMs = 0L
-    private var currentEmaRms = -100f
-    private val EMA_ALPHA = 0.25f // Smoothing factor for transient noise filtering
-    private var dynamicThreshold = 2.0f
-    private var noiseFloorSum = 0f
-    private var noiseSampleCount = 0
-
-    private val amplitudeMonitorRunnable = object : Runnable {
-        override fun run() {
-            if (!isListening) return
-            val now = System.currentTimeMillis()
-            val silenceDuration = now - lastActiveTimeMs
-            if (silenceDuration >= SILENCE_TIMEOUT_MS) {
-                Log.d("VoiceManager", "Real-time amplitude monitor auto-stop triggered. Silence duration: ${silenceDuration}ms (threshold: $amplitudeThreshold dB)")
-                stopListening()
-            } else {
-                mainHandler.postDelayed(this, currentAmplitudeCheckInterval)
-            }
-        }
-    }
-
-    private fun startAmplitudeMonitoring() {
-        mainHandler.removeCallbacks(amplitudeMonitorRunnable)
-        mainHandler.postDelayed(amplitudeMonitorRunnable, currentAmplitudeCheckInterval)
-    }
-
-    private fun stopAmplitudeMonitoring() {
-        mainHandler.removeCallbacks(amplitudeMonitorRunnable)
-    }
-
-    private fun resetSilenceTimer() {
-        mainHandler.removeCallbacks(silenceTimeoutRunnable)
-        mainHandler.postDelayed(silenceTimeoutRunnable, SILENCE_TIMEOUT_MS)
-    }
-
-    private fun cancelSilenceTimer() {
-        mainHandler.removeCallbacks(silenceTimeoutRunnable)
-        stopAmplitudeMonitoring()
-    }
-
-    // --- Automated Storage / Cache Clearing Task ---
-    private val cacheCleanupRunnable = object : Runnable {
-        override fun run() {
-            clearSpeechCache()
-            mainHandler.postDelayed(this, currentCacheCleanupInterval)
-        }
-    }
-
-    private fun startPeriodicCacheCleanup() {
-        mainHandler.removeCallbacks(cacheCleanupRunnable)
-        mainHandler.postDelayed(cacheCleanupRunnable, currentCacheCleanupInterval)
-    }
-
-    private fun stopPeriodicCacheCleanup() {
-        mainHandler.removeCallbacks(cacheCleanupRunnable)
-    }
-
-    fun clearSpeechCache() {
-        try {
-            var deletedBytes = 0L
-            val cacheDirs = listOfNotNull(
-                context.cacheDir,
-                context.externalCacheDir,
-                context.codeCacheDir
-            )
-            for (dir in cacheDirs) {
-                deletedBytes += deleteDirContents(dir)
-            }
-            if (deletedBytes > 0) {
-                Log.d("VoiceManager", "Cleaned up temporary voice buffer/speech cache. Freed: ${deletedBytes / 1024} KB")
-            } else {
-                Log.d("VoiceManager", "Voice speech cache is already clean.")
-            }
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error clearing speech cache: ${e.message}")
-        }
-    }
-
-    private fun deleteDirContents(file: File?): Long {
-        if (file == null || !file.exists()) return 0L
-        var bytesFreed = 0L
-        if (file.isDirectory) {
-            val children = file.listFiles()
-            if (children != null) {
-                for (child in children) {
-                    bytesFreed += getFolderSize(child)
-                    if (child.isDirectory) {
-                        bytesFreed += deleteDirContents(child)
-                    }
-                    try {
-                        child.delete()
-                    } catch (e: Exception) {
-                        Log.e("VoiceManager", "Failed to delete cache file: ${child.absolutePath}")
-                    }
-                }
-            }
-        }
-        return bytesFreed
-    }
-
-    private fun getFolderSize(file: File): Long {
-        if (!file.exists()) return 0L
-        if (file.isFile) return file.length()
-        var size = 0L
-        val children = file.listFiles()
-        if (children != null) {
-            for (child in children) {
-                size += getFolderSize(child)
-            }
-        }
-        return size
-    }
-
     init {
-        initializeSpeechRecognizer()
         initializeTextToSpeech()
-        startPeriodicCacheCleanup()
+        mainHandler.postDelayed(cacheCleanup, 300_000L)
     }
 
-    private fun initializeSpeechRecognizer() {
-        try {
-            if (SpeechRecognizer.isRecognitionAvailable(context)) {
-                speechRecognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) { SpeechRecognizer.createOnDeviceSpeechRecognizer(context) } else { SpeechRecognizer.createSpeechRecognizer(context) }.apply {
-                    setRecognitionListener(object : RecognitionListener {
-                        override fun onReadyForSpeech(params: Bundle?) {
-                            onListeningStateChanged(true)
-                            lastActiveTimeMs = System.currentTimeMillis()
-                            resetSilenceTimer()
-                            startAmplitudeMonitoring()
-                        }
-
-                        override fun onBeginningOfSpeech() {
-                            lastActiveTimeMs = System.currentTimeMillis()
-                            resetSilenceTimer()
-                        }
-
-                        override fun onRmsChanged(rmsdB: Float) {
-                            this@VoiceManager.onRmsChanged(rmsdB)
-
-                            // 1. Dynamic calibration of background noise floor (first 8 samples)
-                            if (noiseSampleCount < 8) {
-                                noiseFloorSum += rmsdB
-                                noiseSampleCount++
-                                if (noiseSampleCount == 8) {
-                                    val estimatedNoiseFloor = noiseFloorSum / 8f
-                                    // Adaptive threshold of noise floor + 2.5 dB, clamped to a reasonable range
-                                    dynamicThreshold = (estimatedNoiseFloor + 2.5f).coerceIn(1.5f, 4.0f)
-                                    Log.d("VoiceManager", "Dynamic threshold calibrated: $dynamicThreshold dB (estimated noise floor: $estimatedNoiseFloor dB)")
-                                }
-                            }
-
-                            // 2. Exponential Moving Average (EMA) smoothing to prevent transient dips (e.g. short breaths) from triggering auto-stop
-                            currentEmaRms = if (currentEmaRms == -100f) {
-                                rmsdB
-                            } else {
-                                EMA_ALPHA * rmsdB + (1f - EMA_ALPHA) * currentEmaRms
-                            }
-                            // RMS is displayed for diagnostics only. It is not used to end a speech session;
-                            // device-specific RMS scales vary and can cut off valid low-volume speech.
-                        }
-
-                        override fun onBufferReceived(buffer: ByteArray?) {}
-
-                        override fun onEndOfSpeech() {
-                            onListeningStateChanged(false)
-                            cancelSilenceTimer()
-                        }
-
-                        override fun onError(error: Int) {
-                            cancelSilenceTimer()
-                            // Some Android recognizers end a session after a brief no-speech window.
-                            // Give manual chat input a small number of transparent retries instead of
-                            // making the microphone feel like it randomly shuts off.
-                            if (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT && isListening && manualRestartCount < 2) {
-                                manualRestartCount++
-                                isListening = false
-                                mainHandler.postDelayed({
-                                    if (!isListening) startListeningInternal(resetRetry = false)
-                                }, 250L)
-                                return
-                            }
-                            manualRestartCount = 0
-                            val errorMessage = when (error) {
-                                SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-                                SpeechRecognizer.ERROR_CLIENT -> "Client-side error"
-                                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
-                                SpeechRecognizer.ERROR_NETWORK -> "Network error"
-                                SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
-                                SpeechRecognizer.ERROR_NO_MATCH -> "No speech recognized"
-                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer is busy"
-                                SpeechRecognizer.ERROR_SERVER -> "Server error"
-                                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input detected"
-                                else -> "Unknown speech error"
-                            }
-                            Log.e("VoiceManager", "Speech recognition error: ")
-                            resumeBackgroundVoice()
-                            onErrorSpeech(errorMessage)
-                            onListeningStateChanged(false)
-                        }
-
-                        override fun onResults(results: Bundle?) {
-                            cancelSilenceTimer()
-                            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            if (!matches.isNullOrEmpty()) {
-                                onFinalSpeech(matches[0])
-                            }
-                            resumeBackgroundVoice()
-                            onListeningStateChanged(false)
-                        }
-
-                        override fun onPartialResults(partialResults: Bundle?) {
-                            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            if (!matches.isNullOrEmpty()) {
-                                lastActiveTimeMs = System.currentTimeMillis()
-                                resetSilenceTimer()
-                                onPartialSpeech(matches[0])
-                            }
-                        }
-
-                        override fun onEvent(eventType: Int, params: Bundle?) {}
-                    })
-                }
-            } else {
-                Log.e("VoiceManager", "Speech recognition is not available on this device")
-                onErrorSpeech("Speech recognition not available")
-            }
+    private fun createRecognizer(): SpeechRecognizer? {
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) return null
+        return try {
+            // The normal Android recognition service is the most compatible path on OEM devices.
+            SpeechRecognizer.createSpeechRecognizer(context)
         } catch (e: Exception) {
-            Log.e("VoiceManager", "Error initializing speech recognizer: ${e.message}")
+            Log.w(tag, "Standard recognizer unavailable: ${e.message}")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+                runCatching { SpeechRecognizer.createOnDeviceSpeechRecognizer(context) }.getOrNull()
+            } else null
         }
+    }
+
+    private fun configureRecognizer() {
+        recognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                listening = true
+                onListeningStateChanged(true)
+                lastPartialAt = System.currentTimeMillis()
+            }
+
+            override fun onBeginningOfSpeech() {
+                lastPartialAt = System.currentTimeMillis()
+            }
+
+            override fun onRmsChanged(rmsdB: Float) {
+                onRmsChanged(rmsdB)
+                lastPartialAt = System.currentTimeMillis()
+            }
+
+            override fun onBufferReceived(buffer: ByteArray?) = Unit
+
+            override fun onEndOfSpeech() {
+                // Do NOT flip the UI back to idle here. Android often delivers onResults shortly after onEndOfSpeech.
+                lastPartialAt = System.currentTimeMillis()
+            }
+
+            override fun onError(error: Int) {
+                Log.w(tag, "SpeechRecognizer error=$error retry=$retryCount")
+                val retryable = error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                    error == SpeechRecognizer.ERROR_NO_MATCH ||
+                    error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                    error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+
+                if (listening && retryable && retryCount < MAX_RETRIES && !shuttingDown) {
+                    retryCount++
+                    mainHandler.postDelayed({ restartListeningAfterError() }, RETRY_DELAY_MS)
+                    return
+                }
+
+                val message = when (error) {
+                    SpeechRecognizer.ERROR_AUDIO -> "The microphone could not be opened."
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission is required."
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech service could not be reached."
+                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "I didn't catch that. Please try again."
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Voice input was busy. Please try again."
+                    else -> "Voice input stopped unexpectedly."
+                }
+                finishListening(message, resume = true)
+            }
+
+            override fun onResults(results: Bundle?) {
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()?.trim().orEmpty()
+                if (text.isBlank()) {
+                    if (retryCount < MAX_RETRIES) {
+                        retryCount++
+                        mainHandler.postDelayed({ restartListeningAfterError() }, RETRY_DELAY_MS)
+                    } else {
+                        finishListening("I didn't catch that. Please try again.", resume = true)
+                    }
+                    return
+                }
+
+                finishListening(null, resume = true)
+                onFinalSpeech(text)
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()?.trim().orEmpty()
+                if (text.isNotBlank()) {
+                    lastPartialAt = System.currentTimeMillis()
+                    onPartialSpeech(text)
+                }
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) = Unit
+        })
+    }
+
+    fun startListening() {
+        if (shuttingDown || listening) return
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            onErrorSpeech("Microphone permission is required.")
+            return
+        }
+
+        pauseBackgroundVoice()
+        retryCount = 0
+        sessionStartedAt = System.currentTimeMillis()
+        startRecognizerSession()
+    }
+
+    private fun startRecognizerSession() {
+        if (shuttingDown) return
+        try {
+            recognizer?.cancel()
+            recognizer?.destroy()
+        } catch (_: Exception) { }
+        recognizer = createRecognizer()
+        if (recognizer == null) {
+            finishListening("Speech recognition is not available on this phone.", resume = true)
+            return
+        }
+        configureRecognizer()
+
+        val language = if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag()
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+        }
+
+        try {
+            recognizer?.startListening(intent)
+            listening = true
+            onListeningStateChanged(true)
+            mainHandler.removeCallbacks(sessionGuard)
+            mainHandler.postDelayed(sessionGuard, MAX_SESSION_MS)
+        } catch (e: Exception) {
+            Log.e(tag, "Unable to start recognizer", e)
+            finishListening("I couldn't start the microphone. Please try again.", resume = true)
+        }
+    }
+
+    private fun restartListeningAfterError() {
+        if (shuttingDown || !listening) return
+        if (System.currentTimeMillis() - sessionStartedAt >= MAX_SESSION_MS) {
+            finishListening("Voice session timed out. Please try again.", resume = true)
+            return
+        }
+        startRecognizerSession()
+    }
+
+    fun stopListening() {
+        if (!listening) return
+        finishListening(null, resume = true)
+    }
+
+    fun cancelListening() {
+        retryCount = MAX_RETRIES + 1
+        finishListening(null, resume = true)
+    }
+
+    private fun finishListening(errorMessage: String?, resume: Boolean) {
+        val wasListening = listening
+        listening = false
+        mainHandler.removeCallbacks(sessionGuard)
+        try { recognizer?.cancel() } catch (_: Exception) { }
+        try { recognizer?.destroy() } catch (_: Exception) { }
+        recognizer = null
+        onListeningStateChanged(false)
+        onPartialSpeech("")
+        if (resume && wasListening) resumeBackgroundVoice()
+        if (!errorMessage.isNullOrBlank()) onErrorSpeech(errorMessage)
     }
 
     private fun pauseBackgroundVoice() {
-        try {
+        runCatching {
             context.sendBroadcast(Intent(BabyAssistantService.ACTION_PAUSE_BACKGROUND_VOICE).setPackage(context.packageName))
-        } catch (e: Exception) {
-            Log.w("VoiceManager", "Unable to pause background voice: ")
         }
     }
 
     private fun resumeBackgroundVoice() {
-        try {
+        runCatching {
             context.sendBroadcast(Intent(BabyAssistantService.ACTION_RESUME_BACKGROUND_VOICE).setPackage(context.packageName))
-        } catch (e: Exception) {
-            Log.w("VoiceManager", "Unable to resume background voice: ")
         }
     }
 
@@ -369,144 +271,63 @@ class VoiceManager(
     }
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            textToSpeech?.let { tts ->
-                val result = tts.setLanguage(Locale.getDefault())
-                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    Log.e("VoiceManager", "Default language is not supported or missing data")
-                    tts.language = Locale.US
-                }
-                isTtsInitialized = true
-                applyVoice()
-
-                tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {
-                        onTtsStart()
-                    }
-
-                    override fun onDone(utteranceId: String?) {
-                        onTtsDone()
-                    }
-
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {
-                        onTtsDone()
-                    }
-
-                    override fun onError(utteranceId: String?, errorCode: Int) {
-                        onTtsDone()
-                    }
-                })
-                onTtsInitialized()
-            }
-        } else {
-            Log.e("VoiceManager", "Initialization of TextToSpeech failed")
-        }
-    }
-
-    fun startListening() {
-        startListeningInternal(resetRetry = true)
-    }
-
-    private fun startListeningInternal(resetRetry: Boolean) {
-        if (isListening) return
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            onErrorSpeech("Microphone permission not granted")
-            return
-        }
-        speechRecognizer?.let { recognizer ->
-            pauseBackgroundVoice()
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            }
-            try {
-                stopSpeaking() // Interrupt speaking if active
-
-                // Initialize/reset real-time monitor parameters
-                lastActiveTimeMs = System.currentTimeMillis()
-                currentEmaRms = -100f
-                dynamicThreshold = 2.0f
-                noiseFloorSum = 0f
-                noiseSampleCount = 0
-
-                if (resetRetry) manualRestartCount = 0
-                recognizer.startListening(intent)
-                isListening = true
-                resetSilenceTimer()
-            } catch (e: Exception) {
-                Log.e("VoiceManager", "Failed to start listening: ${e.message}")
-                resumeBackgroundVoice()
-                onErrorSpeech("Failed to start speech recognition")
-            }
-        } ?: run {
-            onErrorSpeech("Speech recognizer not ready")
-        }
-    }
-
-    fun stopListening() {
-        if (!isListening) return
-        cancelSilenceTimer()
-        try {
-            speechRecognizer?.stopListening()
-            isListening = false
-            resumeBackgroundVoice()
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Failed to stop listening: ${e.message}")
-        }
-    }
-
-    fun cancelListening() {
-        manualRestartCount = 99
-        if (!isListening) return
-        cancelSilenceTimer()
-        try {
-            speechRecognizer?.cancel()
-            isListening = false
-            resumeBackgroundVoice()
-            onListeningStateChanged(false)
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Failed to cancel listening: ${e.message}")
-        }
-    }
-
-    fun speak(text: String, rate: Float = 1.0f, pitch: Float = 1.0f) {
-        if (!isTtsInitialized) {
-            Log.e("VoiceManager", "TextToSpeech is not initialized yet")
+        if (status != TextToSpeech.SUCCESS) {
+            Log.e(tag, "TTS initialization failed")
             return
         }
         textToSpeech?.let { tts ->
-            tts.setSpeechRate(rate)
-            tts.setPitch(pitch)
-            val params = Bundle().apply {
-                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "baby_utterance_id")
+            val result = tts.setLanguage(Locale.US)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                tts.language = Locale.getDefault()
             }
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, "baby_utterance_id")
+            ttsReady = true
+            applyVoice()
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) = onTtsStart()
+                override fun onDone(utteranceId: String?) = onTtsDone()
+                @Deprecated("Deprecated in Java") override fun onError(utteranceId: String?) = onTtsDone()
+                override fun onError(utteranceId: String?, errorCode: Int) = onTtsDone()
+            })
+            onTtsInitialized()
         }
     }
 
-    fun stopSpeaking() {
-        if (isTtsInitialized) {
-            textToSpeech?.stop()
+    private fun applyVoice() {
+        if (!ttsReady) return
+        val name = selectedVoiceName ?: return
+        runCatching {
+            textToSpeech?.voices?.firstOrNull { it.name == name }?.let { textToSpeech?.voice = it }
+        }
+    }
+
+    fun getAvailableVoiceNames(): List<String> = runCatching {
+        val language = Locale.getDefault().language
+        (textToSpeech?.voices ?: emptySet()).filter { it.locale.language == language || it.locale.language == "en" }
+            .map { it.name }.distinct().sorted()
+    }.getOrDefault(emptyList())
+
+    fun speak(text: String, rate: Float = 1f, pitch: Float = 1f) {
+        if (!ttsReady || text.isBlank()) return
+        textToSpeech?.setSpeechRate(rate)
+        textToSpeech?.setPitch(pitch)
+        val params = Bundle().apply { putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "baby_${System.currentTimeMillis()}") }
+        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, params, params.getString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID))
+    }
+
+    fun stopSpeaking() { if (ttsReady) textToSpeech?.stop() }
+
+    fun clearSpeechCache() {
+        listOfNotNull(context.cacheDir, context.externalCacheDir, context.codeCacheDir).forEach { dir ->
+            dir.listFiles()?.forEach { child -> runCatching { child.deleteRecursively() } }
         }
     }
 
     fun destroy() {
-        cancelSilenceTimer()
-        resumeBackgroundVoice()
-        stopPeriodicCacheCleanup()
-        clearSpeechCache()
-        try {
-            speechRecognizer?.destroy()
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error destroying speech recognizer: ${e.message}")
-        }
-        try {
-            textToSpeech?.shutdown()
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error shutting down text to speech: ${e.message}")
-        }
+        shuttingDown = true
+        finishListening(null, resume = false)
+        mainHandler.removeCallbacks(cacheCleanup)
+        stopSpeaking()
+        runCatching { textToSpeech?.shutdown() }
+        textToSpeech = null
     }
 }

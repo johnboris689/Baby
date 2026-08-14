@@ -26,6 +26,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.local.entity.MemoryEntity
 import com.example.ui.viewmodel.BabyViewModel
+import com.example.ui.components.GlassCard
+import com.example.ui.theme.BabyBackground
+import com.example.ui.theme.BabyCyan
+import com.example.ui.theme.BabyMuted
+import com.example.ui.theme.BabyText
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -50,8 +55,9 @@ fun MemoryScreen(
         }
     }
 
-    val primaryBg = Brush.verticalGradient(
-        colors = listOf(Color(0xFF0F172A), Color(0xFF020617))
+    val primaryBg = Brush.radialGradient(
+        colors = listOf(Color(0xFF0B1E3A), Color(0xFF050A15), BabyBackground),
+        radius = 900f
     )
 
     Column(
@@ -296,15 +302,11 @@ fun MemoryItemCard(
         }
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Color.White.copy(alpha = 0.04f))
-            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(14.dp))
-            .padding(14.dp)
+    GlassCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp)
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(14.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
