@@ -86,13 +86,18 @@ class VoiceManager(
     private fun createRecognizer(): SpeechRecognizer? {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) return null
         return try {
-            // The normal Android recognition service is the most compatible path on OEM devices.
-            SpeechRecognizer.createSpeechRecognizer(context)
+            // Prefer the on-device recognizer when the phone exposes one: it avoids
+            // network stalls and is considerably faster for short wake/command phrases.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+            ) {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(context)
+            }
         } catch (e: Exception) {
-            Log.w(tag, "Standard recognizer unavailable: ${e.message}")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-                runCatching { SpeechRecognizer.createOnDeviceSpeechRecognizer(context) }.getOrNull()
-            } else null
+            Log.w(tag, "Preferred recognizer unavailable: ${e.message}")
+            runCatching { SpeechRecognizer.createSpeechRecognizer(context) }.getOrNull()
         }
     }
 
@@ -125,7 +130,9 @@ class VoiceManager(
                 val retryable = error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
                     error == SpeechRecognizer.ERROR_NO_MATCH ||
                     error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
-                    error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+                    error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT ||
+                    error == SpeechRecognizer.ERROR_CLIENT ||
+                    error == SpeechRecognizer.ERROR_SERVER
 
                 if (listening && retryable && retryCount < MAX_RETRIES && !shuttingDown) {
                     retryCount++
@@ -157,7 +164,7 @@ class VoiceManager(
                     return
                 }
 
-                finishListening(null, resume = true)
+                finishListening(null, resume = false)
                 onFinalSpeech(text)
             }
 
@@ -207,7 +214,7 @@ class VoiceManager(
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
 
         try {
@@ -284,9 +291,19 @@ class VoiceManager(
             applyVoice()
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = onTtsStart()
-                override fun onDone(utteranceId: String?) = onTtsDone()
-                @Deprecated("Deprecated in Java") override fun onError(utteranceId: String?) = onTtsDone()
-                override fun onError(utteranceId: String?, errorCode: Int) = onTtsDone()
+                override fun onDone(utteranceId: String?) {
+                    resumeBackgroundVoice()
+                    onTtsDone()
+                }
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    resumeBackgroundVoice()
+                    onTtsDone()
+                }
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    resumeBackgroundVoice()
+                    onTtsDone()
+                }
             })
             onTtsInitialized()
         }

@@ -76,7 +76,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private var wakeWordEnabled = true
     private var wakePhrases = setOf("hey baby", "hi baby", "hello baby")
     private var wakeWordConfidenceThreshold = 0.68f
-    private var minSpeechThreshold = 900.0f // Minimum RMS amplitude for VAD
+    private var minSpeechThreshold = 450.0f // Minimum RMS amplitude for VAD; tuned for normal phone speech
 
     // Debounce & false activation suppression tracking
     private var lastTriggerTimeMs = 0L
@@ -170,7 +170,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             wakeWordEnabled = repo.getSetting("wake_word_enabled", "true").toBoolean()
             isContinuousConversation = repo.getSetting("is_continuous_mode", "false").toBoolean()
             wakeWordConfidenceThreshold = (repo.getSetting("wake_word_confidence_threshold", "0.68").toFloatOrNull() ?: 0.68f).coerceIn(0.55f, 0.90f)
-            minSpeechThreshold = (repo.getSetting("min_speech_threshold", "900.0").toFloatOrNull() ?: 900.0f).coerceIn(500.0f, 3500.0f)
+            minSpeechThreshold = (repo.getSetting("min_speech_threshold", "450.0").toFloatOrNull() ?: 900.0f).coerceIn(250.0f, 3000.0f)
 
             // Phrases settings
             val list = mutableSetOf<String>()
@@ -297,6 +297,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun startPassiveWakeWordListening() {
         if (isPassiveListening || isProcessingCommand || !wakeWordEnabled || backgroundVoicePausedForForeground) return
+        if (passiveListeningJob?.isActive == true) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Log.e(tag, "Audio permission missing for passive listening")
             return
@@ -374,15 +375,15 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     }
 
                     // Require meaningful energy above both the configured floor and ambient noise.
-                    val dynamicThreshold = maxOf(minSpeechThreshold.toDouble(), estimatedNoiseFloor * 1.65).toFloat()
+                    val dynamicThreshold = maxOf(minSpeechThreshold.toDouble(), estimatedNoiseFloor * 1.45).toFloat()
                     if (rms < dynamicThreshold) {
                         consecutiveSpeechFrames = 0
                         continue
                     }
 
                     consecutiveSpeechFrames++
-                    // ~800ms of sustained speech before opening a recognition session.
-                    if (consecutiveSpeechFrames < 3) continue
+                    // ~500ms of sustained speech before checking the wake phrase.
+                    if (consecutiveSpeechFrames < 2) continue
                     consecutiveSpeechFrames = 0
 
                     val now = System.currentTimeMillis()
@@ -407,6 +408,10 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun stopPassiveAudioRecord(expectedGeneration: Long? = null) {
         if (expectedGeneration != null && expectedGeneration != passiveGeneration) return
+        if (expectedGeneration == null) {
+            passiveListeningJob?.cancel()
+            passiveListeningJob = null
+        }
         passiveGeneration++
         isPassiveListening = false
         val recorder = audioRecord
@@ -432,13 +437,20 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
         }
 
         var tempRecognizer: SpeechRecognizer? = null
         var candidateHandled = false
         try {
-            tempRecognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) SpeechRecognizer.createOnDeviceSpeechRecognizer(this) else SpeechRecognizer.createSpeechRecognizer(this)
+            tempRecognizer =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+                ) {
+                    SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+                } else {
+                    SpeechRecognizer.createSpeechRecognizer(this)
+                }
             tempRecognizer.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
@@ -590,11 +602,19 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         updateNotificationText("BabyAI: Activated")
 
         scope.launch {
-            speak("Yes? How can I help?")
-            var waited = 0L
-            while (isSpeaking && waited < 3500L) {
-                delay(100L)
-                waited += 100L
+            // Give TTS a moment to initialize if the service was just started.
+            var initWait = 0L
+            while (!isTtsInitialized && initWait < 1200L) {
+                delay(50L)
+                initWait += 50L
+            }
+            if (isTtsInitialized) {
+                speak("Yes? How can I help?")
+                var waited = 0L
+                while (isSpeaking && waited < 3500L) {
+                    delay(100L)
+                    waited += 100L
+                }
             }
             if (isProcessingCommand) startCommandListening()
         }

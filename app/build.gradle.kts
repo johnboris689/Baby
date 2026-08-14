@@ -1,5 +1,6 @@
 plugins {
   alias(libs.plugins.android.application)
+  alias(libs.plugins.kotlin.android)
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
 }
@@ -36,10 +37,6 @@ android {
     targetCompatibility = JavaVersion.VERSION_21
   }
 
-  kotlinOptions {
-    jvmTarget = "21"
-  }
-
   buildFeatures {
     compose = true
     buildConfig = true
@@ -47,6 +44,12 @@ android {
 
   testOptions {
     unitTests { isIncludeAndroidResources = true }
+  }
+}
+
+kotlin {
+  compilerOptions {
+    jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
   }
 }
 
