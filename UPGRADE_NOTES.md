@@ -39,3 +39,8 @@ This package is based on the latest Baby main source (commit bcc28cd5e16fd4f135b
 ## CI
 
 GitHub Actions installs JDK 21, Android API 36/build-tools 35.0.0 and Gradle 8.13, runs `gradle :app:assembleDebug --no-daemon --stacktrace`, verifies the APK, and uploads `baby-app-debug-apk`.
+
+
+## Build stabilization follow-up
+
+The previous KSP-based build configuration produced a Gradle plugin-classpath conflict before compilation. This revision removes KSP from the build path and uses Kotlin KAPT with Room 2.8.4 instead. This keeps the application source in Kotlin while avoiding the failing KSP plugin resolution path.

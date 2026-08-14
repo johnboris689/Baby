@@ -10,7 +10,6 @@ lifecycleRuntimeCompose = "2.11.0"
 activityCompose = "1.13.0"
 kotlin = "2.3.20"
 composeBom = "2026.06.00"
-googleDevtoolsKsp = "2.3.6"
 navigationCompose = "2.8.9"
 roomRuntime = "2.8.4"
 roomKtx = "2.8.4"
@@ -90,5 +89,5 @@ firebase-appcheck-recaptcha = { group = "com.google.firebase", name = "firebase-
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-kapt = { id = "org.jetbrains.kotlin.kapt", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
-google-devtools-ksp = { id = "com.google.devtools.ksp", version.ref = "googleDevtoolsKsp" }
