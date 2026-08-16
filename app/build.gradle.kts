@@ -21,6 +21,11 @@ android {
         buildConfig = true
         compose = true
     }
+    buildConfigField(
+        "String",
+        "GEMINI_API_KEY",
+        "\"${System.getenv("GEMINI_API_KEY") ?: ""}\""
+    )
 compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21

@@ -29,7 +29,7 @@ fun MyApplicationTheme(content: @Composable () -> Unit) {
 
     MaterialTheme(
         colorScheme = BabyDarkScheme,
-        typography = Typography(),
+        typography = androidx.compose.material3.Typography(),
         content = content
     )
 }

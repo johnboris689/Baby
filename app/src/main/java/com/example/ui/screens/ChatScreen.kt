@@ -61,6 +61,7 @@ import com.example.ui.theme.BabyBackground
 import com.example.ui.theme.BabyBlue
 import com.example.ui.theme.BabyCyan
 import com.example.ui.theme.BabyMuted
+import com.example.ui.theme.BabyPink
 import com.example.ui.theme.BabyText
 import com.example.ui.theme.BabyViolet
 import com.example.ui.viewmodel.AssistantState
