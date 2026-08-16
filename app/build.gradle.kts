@@ -10,6 +10,12 @@ android {
     compileSdk = 36
 
     defaultConfig {
+        buildConfigField(
+            "String",
+            "GEMINI_API_KEY",
+            "\"${System.getenv("GEMINI_API_KEY") ?: ""}\""
+        )
+
         applicationId = "com.baby.ai"
         minSdk = 26
         targetSdk = 35
@@ -21,11 +27,6 @@ android {
         buildConfig = true
         compose = true
     }
-    buildConfigField(
-        "String",
-        "GEMINI_API_KEY",
-        "\"${System.getenv("GEMINI_API_KEY") ?: ""}\""
-    )
 compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
