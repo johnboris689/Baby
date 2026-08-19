@@ -91,7 +91,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private var falseTriggerCount = 0
     private var lastFalseTriggerCheckTimeMs = 0L
     private var suppressionUntilMs = 0L
-    private var backgroundVoicePausedForForeground = false
+    @Volatile private var backgroundVoicePausedForForeground = false
     private var backgroundListeningEnabled = false
     private var backgroundServiceEnabled = false
     private val BACKGROUND_MIC_OWNER = "background_wake_word"
@@ -399,13 +399,24 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 var noiseSampleCount = 0
                 var estimatedNoiseFloor = 120.0
 
-                while (isActive && isPassiveListening && wakeWordEnabled && generation == passiveGeneration) {
+                while (
+                    isActive &&
+                    isPassiveListening &&
+                    wakeWordEnabled &&
+                    generation == passiveGeneration &&
+                    !backgroundVoicePausedForForeground
+                ) {
                     if (isProcessingCommand || isSpeaking) {
                         delay(250)
                         continue
                     }
 
-                    val readSize = recorder.read(buffer, 0, buffer.size)
+                    val readSize = recorder.read(
+                        buffer,
+                        0,
+                        buffer.size,
+                        AudioRecord.READ_NON_BLOCKING
+                    )
                     if (readSize <= 0) {
                         delay(50)
                         continue
