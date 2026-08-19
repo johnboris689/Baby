@@ -1,6 +1,0 @@
-{
-  "name": "Baby",
-  "description": "A standalone AI assistant for Android powered directly by Gemini API with text, voice, and long-term memory.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
