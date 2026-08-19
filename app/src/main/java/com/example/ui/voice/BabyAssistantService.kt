@@ -1,0 +1,969 @@
+package com.example.ui.voice
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.media.ToneGenerator
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.IBinder
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.example.MainActivity
+import com.example.data.NetworkMonitor
+import com.example.data.local.CommandRoutingEngine
+import com.example.data.local.DeviceControlManager
+import com.example.data.local.RoutingResult
+import com.example.data.local.db.AppDatabase
+import com.example.data.repository.BabyRepository
+import com.example.ui.viewmodel.callOnlineAIWrapper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.Locale
+
+class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
+
+    private val tag = "BabyAssistantService"
+    private val channelId = "baby_assistant_channel"
+    private val notificationId = 1001
+
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var textToSpeech: TextToSpeech? = null
+    private var isTtsInitialized = false
+    private var isSpeaking = false
+    private var isListening = false
+    private var isContinuousConversation = false
+    private var isProcessingCommand = false
+    private var commandRetryCount = 0
+
+    // Single stable AudioRecord for passive wake-word detection
+    private var audioRecord: AudioRecord? = null
+    private var passiveListeningJob: Job? = null
+    private var isPassiveListening = false
+    @Volatile private var passiveGeneration = 0L
+
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var serviceActive = false
+    private var repository: BabyRepository? = null
+    private var deviceControlManager: DeviceControlManager? = null
+    private var routingEngine: CommandRoutingEngine? = null
+    private var networkMonitor: NetworkMonitor? = null
+
+    // Setting values
+    private var wakeWordEnabled = true
+    private var wakePhrases = setOf("hey baby", "hi baby", "hello baby")
+    private var wakeWordConfidenceThreshold = 0.68f
+    private var minSpeechThreshold = 450.0f // Minimum RMS amplitude for VAD; tuned for normal phone speech
+
+    // Debounce & false activation suppression tracking
+    private var lastTriggerTimeMs = 0L
+    private val DEBOUNCE_WINDOW_MS = 3000L
+    private var falseTriggerCount = 0
+    private var lastFalseTriggerCheckTimeMs = 0L
+    private var suppressionUntilMs = 0L
+    private var backgroundVoicePausedForForeground = false
+    private var backgroundListeningEnabled = false
+    private var backgroundServiceEnabled = false
+    private val BACKGROUND_MIC_OWNER = "background_wake_word"
+    private val BACKGROUND_CANDIDATE_OWNER = "background_wake_candidate"
+    private val MIC_HANDOFF_TIMEOUT_MS = 2500L
+    private val MIC_HANDOFF_POLL_MS = 100L
+
+    companion object {
+        const val ACTION_PAUSE_BACKGROUND_VOICE = "com.example.ACTION_PAUSE_BACKGROUND_VOICE"
+        const val ACTION_RESUME_BACKGROUND_VOICE = "com.example.ACTION_RESUME_BACKGROUND_VOICE"
+    }
+
+    private val notificationReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.example.ACTION_SPEAK_NOTIFICATION") {
+                val text = intent.getStringExtra("text") ?: return
+                speak(text)
+            }
+        }
+    }
+
+    private val backgroundVoiceControlReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_PAUSE_BACKGROUND_VOICE -> {
+                    backgroundVoicePausedForForeground = true
+                    stopPassiveAudioRecord()
+                    try { speechRecognizer?.cancel() } catch (_: Exception) { }
+                    try { speechRecognizer?.destroy() } catch (_: Exception) { }
+                    speechRecognizer = null
+                    isListening = false
+                    isProcessingCommand = false
+                    commandRetryCount = 0
+                    MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+                    updateNotificationText("BabyAI: Background mic paused for chat")
+                }
+                ACTION_RESUME_BACKGROUND_VOICE -> {
+                    backgroundVoicePausedForForeground = false
+                    if (speechRecognizer == null) initializeSpeechRecognizer()
+                    if (canRunBackgroundWakeWord() && !isProcessingCommand && !isSpeaking) {
+                        mainHandler.postDelayed(
+                            { if (canRunBackgroundWakeWord() && !isProcessingCommand && !isSpeaking) startPassiveWakeWordListening() },
+                            450L
+                        )
+                        updateNotificationText("BabyAI Background Assistant active")
+                    }
+                }
+            }
+        }
+    }
+    override fun onCreate() {
+        super.onCreate()
+        serviceActive = true
+        Log.d(tag, "Service onCreate")
+        val dcm = DeviceControlManager(this)
+        deviceControlManager = dcm
+        routingEngine = CommandRoutingEngine(dcm)
+
+        val db = AppDatabase.getDatabase(applicationContext)
+        repository = BabyRepository(
+            db.conversationDao(),
+            db.messageDao(),
+            db.memoryDao(),
+            db.settingDao(),
+            db.logDao(),
+            db.noteDao(),
+            db.taskDao(),
+            db.automationRuleDao()
+        )
+
+        createNotificationChannel()
+        val notification = createNotification("BabyAI Background Assistant active")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                notificationId,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(notificationId, notification)
+        }
+
+        initializeTTS()
+        initializeSpeechRecognizer()
+
+        val notificationFilter = IntentFilter("com.example.ACTION_SPEAK_NOTIFICATION")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(notificationReceiver, notificationFilter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(notificationReceiver, notificationFilter)
+        }
+
+        val voiceControlFilter = IntentFilter().apply {
+            addAction(ACTION_PAUSE_BACKGROUND_VOICE)
+            addAction(ACTION_RESUME_BACKGROUND_VOICE)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(backgroundVoiceControlReceiver, voiceControlFilter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(backgroundVoiceControlReceiver, voiceControlFilter)
+        }
+
+        setupNetworkMonitor()
+        loadSettingsAndStart()
+    }
+
+    private fun loadSettingsAndStart() {
+        scope.launch {
+            val repo = repository ?: return@launch
+            wakeWordEnabled = repo.getSetting("wake_word_enabled", "false").toBoolean()
+            backgroundListeningEnabled = repo.getSetting("background_listening_enabled", "false").toBoolean()
+            backgroundServiceEnabled = repo.getSetting("background_service", "false").toBoolean()
+            isContinuousConversation = repo.getSetting("is_continuous_mode", "false").toBoolean()
+            wakeWordConfidenceThreshold = (repo.getSetting("wake_word_confidence_threshold", "0.68").toFloatOrNull() ?: 0.68f).coerceIn(0.55f, 0.90f)
+            minSpeechThreshold = (repo.getSetting("min_speech_threshold", "450.0").toFloatOrNull() ?: 900.0f).coerceIn(250.0f, 3000.0f)
+
+            // Phrases settings
+            val list = mutableSetOf<String>()
+            if (repo.getSetting("wake_phrase_hey_baby", "true").toBoolean()) list.add("hey baby")
+            if (repo.getSetting("wake_phrase_hi_baby", "true").toBoolean()) list.add("hi baby")
+            if (repo.getSetting("wake_phrase_hello_baby", "true").toBoolean()) list.add("hello baby")
+            if (repo.getSetting("wake_phrase_baby", "true").toBoolean()) list.add("baby")
+
+            val customPhrase = repo.getSetting("custom_wake_phrase", "").trim().lowercase(Locale.ROOT)
+            if (customPhrase.isNotEmpty()) {
+                list.add(customPhrase)
+            }
+
+            if (list.isNotEmpty()) {
+                wakePhrases = list
+            }
+
+            if (canRunBackgroundWakeWord()) {
+                startPassiveWakeWordListening()
+            }
+        }
+    }
+
+    private fun initializeTTS() {
+        textToSpeech = TextToSpeech(this, this)
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            textToSpeech?.let { tts ->
+                val localeResult = tts.setLanguage(Locale.getDefault())
+                if (localeResult == TextToSpeech.LANG_MISSING_DATA || localeResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    tts.language = Locale.US
+                }
+                isTtsInitialized = true
+                tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {
+                        isSpeaking = true
+                    }
+                    override fun onDone(utteranceId: String?) {
+                        isSpeaking = false
+                    }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        isSpeaking = false
+                    }
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        isSpeaking = false
+                    }
+                })
+            }
+        }
+    }
+
+    private fun initializeSpeechRecognizer() {
+        if (SpeechRecognizer.isRecognitionAvailable(this)) {
+            speechRecognizer = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) SpeechRecognizer.createOnDeviceSpeechRecognizer(this) else SpeechRecognizer.createSpeechRecognizer(this)).apply {
+                setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        Log.d(tag, "Recognizer ready for command speech")
+                        isListening = true
+                    }
+
+                    override fun onBeginningOfSpeech() {
+                        Log.d(tag, "Command speech beginning")
+                    }
+
+                    override fun onRmsChanged(rmsdB: Float) {}
+
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+
+                    override fun onEndOfSpeech() {
+                        Log.d(tag, "Command speech ended")
+                        isListening = false
+                    }
+
+                    override fun onError(error: Int) {
+                        isListening = false
+                        MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+                        Log.w(tag, "Command SpeechRecognizer Error: $error")
+                        val retryable = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                            error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                            error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                            error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+                        if (isProcessingCommand && retryable && commandRetryCount < 3) {
+                            commandRetryCount++
+                            scope.launch {
+                                delay(350L)
+                                if (isProcessingCommand) startCommandListening()
+                            }
+                        } else if (isProcessingCommand) {
+                            commandRetryCount = 0
+                            isProcessingCommand = false
+                            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                        }
+                    }
+
+                    override fun onResults(results: Bundle?) {
+                        isListening = false
+                        MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty() && matches[0].trim().isNotEmpty()) {
+                            commandRetryCount = 0
+                            val text = matches[0].trim().lowercase(Locale.ROOT)
+                            Log.d(tag, "Command speech result: $text")
+                            handleCommandSpeechResult(text)
+                        } else if (isProcessingCommand && commandRetryCount < 3) {
+                            commandRetryCount++
+                            scope.launch { delay(300L); if (isProcessingCommand) startCommandListening() }
+                        } else {
+                            commandRetryCount = 0
+                            isProcessingCommand = false
+                            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                        }
+                    }
+
+                    override fun onPartialResults(partialResults: Bundle?) {}
+
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+            }
+        }
+    }
+
+    // --- Passive AudioRecord Wake-Word Engine ---
+
+    private fun canRunBackgroundWakeWord(): Boolean =
+        serviceActive && backgroundServiceEnabled && backgroundListeningEnabled && wakeWordEnabled && !backgroundVoicePausedForForeground
+
+    private fun startPassiveWakeWordListening() {
+        if (!canRunBackgroundWakeWord() || isPassiveListening || isProcessingCommand) return
+        if (passiveListeningJob?.isActive == true) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.e(tag, "Audio permission missing for passive listening")
+            return
+        }
+
+        stopPassiveAudioRecord()
+        val generation = ++passiveGeneration
+
+        passiveListeningJob = scope.launch(Dispatchers.IO) {
+            val sampleRate = 16000
+            val channelConfig = AudioFormat.CHANNEL_IN_MONO
+            val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+            val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+            val bufferSize = maxOf(minBufferSize, 4096)
+
+            var recorderForRelease: AudioRecord? = null
+
+            try {
+                if (!MicrophoneArbiter.tryAcquire(BACKGROUND_MIC_OWNER)) {
+                    // Manual voice input currently owns the microphone. The foreground
+                    // controller will send RESUME when it is safe to try again.
+                    return@launch
+                }
+
+                val recorder = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    sampleRate,
+                    channelConfig,
+                    audioFormat,
+                    bufferSize
+                )
+
+                recorderForRelease = recorder
+
+                if (generation != passiveGeneration) {
+                    recorder.release()
+                    recorderForRelease = null
+                    MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+                    return@launch
+                }
+
+                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.e(tag, "AudioRecord failed to initialize")
+                    recorder.release()
+                    recorderForRelease = null
+                    MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+                    return@launch
+                }
+
+                audioRecord = recorder
+                recorder.startRecording()
+                isPassiveListening = true
+                Log.d(tag, "Passive wake-word AudioRecord session started (generation=$generation)")
+
+                val buffer = ShortArray(bufferSize / 2)
+                var consecutiveSpeechFrames = 0
+                var noiseFloorSum = 0.0
+                var noiseSampleCount = 0
+                var estimatedNoiseFloor = 120.0
+
+                while (isActive && isPassiveListening && wakeWordEnabled && generation == passiveGeneration) {
+                    if (isProcessingCommand || isSpeaking) {
+                        delay(250)
+                        continue
+                    }
+
+                    val readSize = recorder.read(buffer, 0, buffer.size)
+                    if (readSize <= 0) {
+                        delay(50)
+                        continue
+                    }
+
+                    var sumSquare = 0.0
+                    for (i in 0 until readSize) {
+                        val sample = buffer[i].toDouble()
+                        sumSquare += sample * sample
+                    }
+                    val rms = Math.sqrt(sumSquare / readSize).toFloat()
+
+                    // Calibrate over a longer quiet window so a single sound cannot become the noise floor.
+                    if (noiseSampleCount < 25) {
+                        noiseFloorSum += rms
+                        noiseSampleCount++
+                        if (noiseSampleCount == 25) {
+                            estimatedNoiseFloor = (noiseFloorSum / 25.0).coerceIn(20.0, 2500.0)
+                            Log.d(tag, "Estimated ambient noise floor: $estimatedNoiseFloor")
+                        }
+                        continue
+                    }
+
+                    // Require meaningful energy above both the configured floor and ambient noise.
+                    val dynamicThreshold = maxOf(minSpeechThreshold.toDouble(), estimatedNoiseFloor * 1.45).toFloat()
+                    if (rms < dynamicThreshold) {
+                        consecutiveSpeechFrames = 0
+                        continue
+                    }
+
+                    consecutiveSpeechFrames++
+                    // Require roughly 0.8-1.0s of sustained energy before invoking
+                    // SpeechRecognizer. This prevents taps, music and short noises
+                    // from repeatedly turning the microphone on/off.
+                    if (consecutiveSpeechFrames < 4) continue
+                    consecutiveSpeechFrames = 0
+
+                    val now = System.currentTimeMillis()
+                    if (now < suppressionUntilMs || now - lastTriggerTimeMs < DEBOUNCE_WINDOW_MS) continue
+
+                    withContext(Dispatchers.Main) {
+                        if (generation == passiveGeneration && !isProcessingCommand && !isSpeaking && !backgroundVoicePausedForForeground) {
+                            evaluateSpeechCandidate(rms)
+                        }
+                    }
+                    delay(500)
+                }
+            } catch (e: Exception) {
+                if (generation == passiveGeneration && e !is kotlinx.coroutines.CancellationException) {
+                    Log.e(tag, "Passive wake-word listener stopped: ${e.message}", e)
+                }
+            } finally {
+                // Release AudioRecord on the same worker that owns the blocking read.
+                // Releasing it from the main thread while read() is active can race the
+                // native audio stack and is a common cause of microphone-related crashes.
+                recorderForRelease?.let { releasePassiveRecorder(it) }
+                MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+            }
+        }
+    }
+
+    private fun stopPassiveAudioRecord(expectedGeneration: Long? = null) {
+        if (expectedGeneration != null && expectedGeneration != passiveGeneration) return
+
+        if (expectedGeneration == null) {
+            passiveGeneration++
+            isPassiveListening = false
+            passiveListeningJob?.cancel()
+            passiveListeningJob = null
+        }
+
+        // Stop the active read, but do NOT release the recorder from this thread.
+        // The owning IO coroutine releases it in finally{} after read() returns.
+        val recorder = audioRecord
+        if (recorder != null) {
+            try {
+                recorder.stop()
+            } catch (_: Exception) {
+                // Already stopped; the owner will still release it safely.
+            }
+        }
+    }
+
+    private fun releasePassiveRecorder(recorder: AudioRecord) {
+        if (audioRecord === recorder) {
+            audioRecord = null
+        }
+        try {
+            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                recorder.stop()
+            }
+        } catch (_: Exception) { }
+        try {
+            recorder.release()
+        } catch (e: Exception) {
+            Log.e(tag, "Error releasing AudioRecord", e)
+        }
+    }
+
+    private fun evaluateSpeechCandidate(rms: Float) {
+        if (isProcessingCommand || isSpeaking || !canRunBackgroundWakeWord()) return
+
+        // Stop AudioRecord first. The recorder is released by its owning IO coroutine;
+        // do not start SpeechRecognizer until the arbiter confirms the native mic is free.
+        stopPassiveAudioRecord()
+        waitForWakeCandidateMic(rms, 0L)
+    }
+
+    private fun waitForWakeCandidateMic(rms: Float, elapsedMs: Long) {
+        if (isProcessingCommand || isSpeaking || !canRunBackgroundWakeWord()) return
+
+        if (!MicrophoneArbiter.tryAcquire(BACKGROUND_CANDIDATE_OWNER)) {
+            if (elapsedMs >= MIC_HANDOFF_TIMEOUT_MS) {
+                Log.w(tag, "Timed out waiting for microphone handoff to wake-word recognizer")
+                if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                return
+            }
+            mainHandler.postDelayed(
+                { waitForWakeCandidateMic(rms, elapsedMs + MIC_HANDOFF_POLL_MS) },
+                MIC_HANDOFF_POLL_MS
+            )
+            return
+        }
+
+        startWakeCandidateRecognizer(rms)
+    }
+
+    private fun startWakeCandidateRecognizer(rms: Float) {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+        }
+
+        var tempRecognizer: SpeechRecognizer? = null
+        var candidateHandled = false
+        var timeout: Runnable = Runnable { }
+
+        fun finishCandidate(resumePassive: Boolean) {
+            if (candidateHandled) return
+            candidateHandled = true
+            mainHandler.removeCallbacks(timeout)
+            runCatching { tempRecognizer?.cancel() }
+            runCatching { tempRecognizer?.destroy() }
+            MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
+            if (resumePassive && canRunBackgroundWakeWord() && !isProcessingCommand) {
+                mainHandler.postDelayed(
+                    { if (canRunBackgroundWakeWord() && !isProcessingCommand && !isSpeaking) startPassiveWakeWordListening() },
+                    450L
+                )
+            }
+        }
+
+        try {
+            tempRecognizer = if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+            ) {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(this)
+            }
+
+            tempRecognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) = Unit
+                override fun onBeginningOfSpeech() = Unit
+                override fun onRmsChanged(rmsdB: Float) = Unit
+                override fun onBufferReceived(buffer: ByteArray?) = Unit
+                override fun onEndOfSpeech() = Unit
+
+                override fun onError(error: Int) {
+                    Log.d(tag, "Wake candidate recognizer error: $error")
+                    finishCandidate(resumePassive = true)
+                }
+
+                override fun onResults(results: Bundle?) {
+                    if (candidateHandled) return
+                    val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
+                    if (text.isNotBlank()) {
+                        finishCandidate(resumePassive = false)
+                        processWakeWordCandidate(text, rms)
+                    } else {
+                        finishCandidate(resumePassive = true)
+                    }
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    if (candidateHandled) return
+                    val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
+                    if (partial.isNotBlank()) {
+                        val best = wakePhrases.maxOfOrNull { calculateWakeWordConfidence(partial, it) } ?: 0f
+                        if (best >= wakeWordConfidenceThreshold) {
+                            finishCandidate(resumePassive = false)
+                            processWakeWordCandidate(partial, rms)
+                        }
+                    }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) = Unit
+            })
+
+            timeout = Runnable { finishCandidate(resumePassive = true) }
+            mainHandler.postDelayed(timeout, 7000L)
+            tempRecognizer.startListening(intent)
+        } catch (e: Exception) {
+            Log.e(tag, "Error starting candidate speech check", e)
+            finishCandidate(resumePassive = true)
+        }
+    }
+
+    private fun processWakeWordCandidate(text: String, rms: Float) {
+        var highestConfidence = 0.0f
+        var matchedPhrase = ""
+
+        for (phrase in wakePhrases) {
+            val conf = calculateWakeWordConfidence(text, phrase)
+            if (conf > highestConfidence) {
+                highestConfidence = conf
+                matchedPhrase = phrase
+            }
+        }
+
+        if (highestConfidence >= wakeWordConfidenceThreshold && matchedPhrase.isNotEmpty()) {
+            val now = System.currentTimeMillis()
+            lastTriggerTimeMs = now
+            falseTriggerCount = 0
+
+            Log.d(tag, "CONFIDENT WAKE-WORD DETECTED! Matched: '$matchedPhrase', Text: '$text', Confidence: $highestConfidence, RMS: $rms")
+            scope.launch { repository?.addLog("Voice_Service", "Wake-word detected: '$matchedPhrase' (Confidence: ${"%.2f".format(highestConfidence)})") }
+
+            triggerWakeActivation()
+        } else {
+            Log.d(tag, "REJECTED Candidate Speech: '$text', Highest Confidence: $highestConfidence (< threshold $wakeWordConfidenceThreshold)")
+
+            // Track false activations for automatic suppression
+            val now = System.currentTimeMillis()
+            if (now - lastFalseTriggerCheckTimeMs > 20000) {
+                falseTriggerCount = 1
+                lastFalseTriggerCheckTimeMs = now
+            } else {
+                falseTriggerCount++
+                if (falseTriggerCount >= 3) {
+                    suppressionUntilMs = now + 15000 // Suppress triggers for 15s
+                    Log.w(tag, "Automatic suppression activated for 15s due to $falseTriggerCount false candidate triggers in 20s")
+                    scope.launch { repository?.addLog("Voice_Service", "Suppression activated for 15s due to repeated false triggers") }
+                }
+            }
+
+            // Silently resume passive AudioRecord loop
+            if (wakeWordEnabled && !isProcessingCommand) {
+                startPassiveWakeWordListening()
+            }
+        }
+    }
+
+    private fun calculateWakeWordConfidence(text: String, phrase: String): Float {
+        val cleanText = text.trim().lowercase(Locale.ROOT)
+        val cleanPhrase = phrase.trim().lowercase(Locale.ROOT)
+
+        if (cleanText.isEmpty() || cleanPhrase.isEmpty()) return 0.0f
+
+        if (cleanText == cleanPhrase) return 1.0f // Exact match
+
+        if (cleanText.startsWith("$cleanPhrase ") || cleanText.endsWith(" $cleanPhrase") || cleanText.contains(" $cleanPhrase ")) {
+            return 0.90f // Word boundary match
+        }
+
+        if (cleanText.contains(cleanPhrase)) {
+            val ratio = cleanPhrase.length.toFloat() / cleanText.length.toFloat()
+            return (0.70f + (ratio * 0.25f)).coerceIn(0.70f, 0.95f)
+        }
+
+        // Token match
+        val textTokens = cleanText.split("\\s+".toRegex())
+        val phraseTokens = cleanPhrase.split("\\s+".toRegex())
+        var matches = 0
+        for (pToken in phraseTokens) {
+            if (textTokens.contains(pToken)) matches++
+        }
+        if (phraseTokens.isNotEmpty()) {
+            val matchRatio = matches.toFloat() / phraseTokens.size.toFloat()
+            if (matchRatio >= 1.0f) return 0.85f
+            if (matchRatio >= 0.5f) return 0.50f
+        }
+
+        return 0.0f
+    }
+
+    private fun triggerWakeActivation() {
+        stopPassiveAudioRecord()
+        isProcessingCommand = true
+        commandRetryCount = 0
+
+        // Play activation tone ONCE when confidently activated
+        try {
+            val toneG = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+            toneG.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to play beep sound", e)
+        }
+
+        updateNotificationText("BabyAI: Activated")
+
+        scope.launch {
+            // Give TTS a moment to initialize if the service was just started.
+            var initWait = 0L
+            while (!isTtsInitialized && initWait < 1200L) {
+                delay(50L)
+                initWait += 50L
+            }
+            if (isTtsInitialized) {
+                speak("Yes? How can I help?")
+                var waited = 0L
+                while (isSpeaking && waited < 3500L) {
+                    delay(100L)
+                    waited += 100L
+                }
+            }
+            if (isProcessingCommand) startCommandListening()
+        }
+    }
+
+    private fun startCommandListening() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            isProcessingCommand = false
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+            return
+        }
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 900L)
+        }
+
+        try {
+            if (speechRecognizer == null) initializeSpeechRecognizer()
+            val recognizer = speechRecognizer
+            if (recognizer == null) {
+                Log.w(tag, "Speech recognizer unavailable for command listening")
+                isProcessingCommand = false
+                if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                return
+            }
+
+            if (!MicrophoneArbiter.tryAcquire(BACKGROUND_MIC_OWNER)) {
+                isProcessingCommand = false
+                if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                return
+            }
+            recognizer.startListening(intent)
+            isListening = true
+            Log.d(tag, "Listening for user command")
+        } catch (e: Exception) {
+            Log.e(tag, "Error starting command listening", e)
+            MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+            isProcessingCommand = false
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+        }
+    }
+
+    private fun handleCommandSpeechResult(text: String) {
+        if (isProcessingCommand) {
+            scope.launch {
+                processCommand(text)
+            }
+        } else {
+            processWakeWordCandidate(text, 3000f)
+        }
+    }
+
+    private suspend fun processCommand(commandText: String) {
+        if (commandText.trim().isEmpty()) {
+            isProcessingCommand = false
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+            return
+        }
+
+        Log.d(tag, "Processing Voice Command: $commandText")
+        repository?.addLog("Voice_Service", "Command received: $commandText")
+
+        // Create or load active conversation ID
+        val activeConvId = repository?.allConversations?.firstOrNull()?.firstOrNull()?.id
+            ?: repository?.addConversation("Voice Conversation") ?: 1L
+
+        // Save command into database
+        repository?.addMessage(activeConvId, "user", commandText)
+
+        // 1. Route intent using CommandRoutingEngine
+        val routeResult = routingEngine?.routeAndExecute(commandText) ?: RoutingResult.SendToGemini
+
+        if (routeResult is RoutingResult.LocalCommand) {
+            val response = routeResult.responseText
+            repository?.addMessage(activeConvId, "assistant", response)
+            speak(response)
+
+            isProcessingCommand = false
+            if (isContinuousConversation) {
+                delay(600)
+                startCommandListening()
+            } else if (wakeWordEnabled) {
+                delay(500)
+                startPassiveWakeWordListening()
+            }
+            return
+        }
+
+        // 2. Otherwise fall back to Gemini AI response
+        updateNotificationText("BabyAI: Thinking...")
+        try {
+            val apiKey = repository?.getSetting("api_key", "") ?: ""
+            val lastMessages = repository?.getMessages(activeConvId)?.firstOrNull()?.takeLast(6) ?: emptyList()
+            val messagesHistory = if (lastMessages.isNotEmpty()) {
+                lastMessages.map {
+                    mapOf("role" to it.role, "content" to it.content)
+                }
+            } else {
+                listOf(mapOf("role" to "user", "content" to commandText))
+            }
+
+            val aiResponse = callOnlineAIWrapper(commandText, messagesHistory, apiKey, repository)
+
+            repository?.addMessage(activeConvId, "assistant", aiResponse)
+            speak(aiResponse)
+        } catch (e: Exception) {
+            val errMsg = "Sorry, I had an error processing that: ${e.localizedMessage}"
+            repository?.addMessage(activeConvId, "assistant", errMsg)
+            speak("Sorry, I couldn't complete that request.")
+        } finally {
+            updateNotificationText("BabyAI Background Assistant active")
+            isProcessingCommand = false
+            if (isContinuousConversation) {
+                delay(600)
+                startCommandListening()
+            } else if (wakeWordEnabled) {
+                delay(500)
+                startPassiveWakeWordListening()
+            }
+        }
+    }
+
+    private fun speak(text: String) {
+        if (!isTtsInitialized) return
+        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "service_tts_id")
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val serviceChannel = NotificationChannel(
+                channelId,
+                "BabyAI Assistant Channel",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(serviceChannel)
+        }
+    }
+
+    private fun createNotification(content: String): Notification {
+        val notificationIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle("BabyAI Assistant")
+            .setContentText(content)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun updateNotificationText(content: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(notificationId, createNotification(content))
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d(tag, "Service onStartCommand")
+        if (intent?.action == ACTION_PAUSE_BACKGROUND_VOICE) {
+            backgroundVoicePausedForForeground = true
+            stopPassiveAudioRecord()
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_RESUME_BACKGROUND_VOICE) {
+            backgroundVoicePausedForForeground = false
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+            return START_STICKY
+        }
+        if (intent?.action == "STOP_SERVICE") {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // Settings such as wake-word/background-listening can be changed while this
+        // foreground service is already alive. Refresh them on every normal start
+        // command so disabling the toggle actually stops microphone capture.
+        scope.launch {
+            val repo = repository ?: return@launch
+            wakeWordEnabled = repo.getSetting("wake_word_enabled", "false").toBoolean()
+            backgroundListeningEnabled = repo.getSetting("background_listening_enabled", "false").toBoolean()
+            backgroundServiceEnabled = repo.getSetting("background_service", "false").toBoolean()
+            if (canRunBackgroundWakeWord()) {
+                startPassiveWakeWordListening()
+            } else {
+                stopPassiveAudioRecord()
+            }
+        }
+        return START_STICKY
+    }
+
+    private fun setupNetworkMonitor() {
+        val monitor = NetworkMonitor(applicationContext)
+        networkMonitor = monitor
+        scope.launch {
+            monitor.isConnected.collect { available ->
+                val repo = repository ?: return@collect
+                repo.addLog("Voice_Service", "Network connectivity: ${if (available) "CONNECTED" else "DISCONNECTED"}")
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+
+    override fun onDestroy() {
+        serviceActive = false
+        Log.d(tag, "Service onDestroy")
+        try {
+            unregisterReceiver(backgroundVoiceControlReceiver)
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to unregister background voice receiver", e)
+        }
+        try {
+            unregisterReceiver(notificationReceiver)
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to unregister notification receiver", e)
+        }
+        mainHandler.removeCallbacksAndMessages(null)
+        passiveListeningJob?.cancel()
+        stopPassiveAudioRecord()
+        MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+        try { speechRecognizer?.cancel() } catch (_: Exception) { }
+        try { speechRecognizer?.destroy() } catch (_: Exception) { }
+        speechRecognizer = null
+        textToSpeech?.shutdown()
+        scope.cancel()
+    }
+}
