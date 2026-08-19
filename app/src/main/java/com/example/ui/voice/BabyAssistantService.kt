@@ -88,6 +88,12 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private var lastFalseTriggerCheckTimeMs = 0L
     private var suppressionUntilMs = 0L
     private var backgroundVoicePausedForForeground = false
+    private var backgroundListeningEnabled = false
+    private var backgroundServiceEnabled = false
+    private val BACKGROUND_MIC_OWNER = "background_wake_word"
+    private val BACKGROUND_CANDIDATE_OWNER = "background_wake_candidate"
+    private val MIC_HANDOFF_TIMEOUT_MS = 2500L
+    private val MIC_HANDOFF_POLL_MS = 100L
 
     companion object {
         const val ACTION_PAUSE_BACKGROUND_VOICE = "com.example.ACTION_PAUSE_BACKGROUND_VOICE"
@@ -172,7 +178,9 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun loadSettingsAndStart() {
         scope.launch {
             val repo = repository ?: return@launch
-            wakeWordEnabled = repo.getSetting("wake_word_enabled", "true").toBoolean()
+            wakeWordEnabled = repo.getSetting("wake_word_enabled", "false").toBoolean()
+            backgroundListeningEnabled = repo.getSetting("background_listening_enabled", "false").toBoolean()
+            backgroundServiceEnabled = repo.getSetting("background_service", "false").toBoolean()
             isContinuousConversation = repo.getSetting("is_continuous_mode", "false").toBoolean()
             wakeWordConfidenceThreshold = (repo.getSetting("wake_word_confidence_threshold", "0.68").toFloatOrNull() ?: 0.68f).coerceIn(0.55f, 0.90f)
             minSpeechThreshold = (repo.getSetting("min_speech_threshold", "450.0").toFloatOrNull() ?: 900.0f).coerceIn(250.0f, 3000.0f)
@@ -193,7 +201,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 wakePhrases = list
             }
 
-            if (wakeWordEnabled) {
+            if (canRunBackgroundWakeWord()) {
                 startPassiveWakeWordListening()
             }
         }
@@ -254,6 +262,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
                     override fun onError(error: Int) {
                         isListening = false
+                        MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
                         Log.w(tag, "Command SpeechRecognizer Error: $error")
                         val retryable = error == SpeechRecognizer.ERROR_NO_MATCH ||
                             error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
@@ -268,12 +277,13 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                         } else if (isProcessingCommand) {
                             commandRetryCount = 0
                             isProcessingCommand = false
-                            if (wakeWordEnabled) startPassiveWakeWordListening()
+                            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
                         }
                     }
 
                     override fun onResults(results: Bundle?) {
                         isListening = false
+                        MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         if (!matches.isNullOrEmpty() && matches[0].trim().isNotEmpty()) {
                             commandRetryCount = 0
@@ -286,7 +296,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                         } else {
                             commandRetryCount = 0
                             isProcessingCommand = false
-                            if (wakeWordEnabled) startPassiveWakeWordListening()
+                            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
                         }
                     }
 
@@ -300,8 +310,11 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
     // --- Passive AudioRecord Wake-Word Engine ---
 
+    private fun canRunBackgroundWakeWord(): Boolean =
+        isActive && backgroundServiceEnabled && backgroundListeningEnabled && wakeWordEnabled && !backgroundVoicePausedForForeground
+
     private fun startPassiveWakeWordListening() {
-        if (isPassiveListening || isProcessingCommand || !wakeWordEnabled || backgroundVoicePausedForForeground) return
+        if (!canRunBackgroundWakeWord() || isPassiveListening || isProcessingCommand) return
         if (passiveListeningJob?.isActive == true) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Log.e(tag, "Audio permission missing for passive listening")
@@ -321,6 +334,12 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             var recorderForRelease: AudioRecord? = null
 
             try {
+                if (!MicrophoneArbiter.tryAcquire(BACKGROUND_MIC_OWNER)) {
+                    // Manual voice input currently owns the microphone. The foreground
+                    // controller will send RESUME when it is safe to try again.
+                    return@launch
+                }
+
                 val recorder = AudioRecord(
                     MediaRecorder.AudioSource.VOICE_RECOGNITION,
                     sampleRate,
@@ -334,6 +353,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 if (generation != passiveGeneration) {
                     recorder.release()
                     recorderForRelease = null
+                    MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
                     return@launch
                 }
 
@@ -341,6 +361,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     Log.e(tag, "AudioRecord failed to initialize")
                     recorder.release()
                     recorderForRelease = null
+                    MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
                     return@launch
                 }
 
@@ -393,8 +414,10 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     }
 
                     consecutiveSpeechFrames++
-                    // ~500ms of sustained speech before checking the wake phrase.
-                    if (consecutiveSpeechFrames < 2) continue
+                    // Require roughly 0.8-1.0s of sustained energy before invoking
+                    // SpeechRecognizer. This prevents taps, music and short noises
+                    // from repeatedly turning the microphone on/off.
+                    if (consecutiveSpeechFrames < 4) continue
                     consecutiveSpeechFrames = 0
 
                     val now = System.currentTimeMillis()
@@ -416,6 +439,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 // Releasing it from the main thread while read() is active can race the
                 // native audio stack and is a common cause of microphone-related crashes.
                 recorderForRelease?.let { releasePassiveRecorder(it) }
+                MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
             }
         }
     }
@@ -459,11 +483,34 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun evaluateSpeechCandidate(rms: Float) {
-        if (isProcessingCommand || isSpeaking) return
+        if (isProcessingCommand || isSpeaking || !canRunBackgroundWakeWord()) return
 
-        // Temporarily pause passive AudioRecord while SpeechRecognizer captures text candidate
+        // Stop AudioRecord first. The recorder is released by its owning IO coroutine;
+        // do not start SpeechRecognizer until the arbiter confirms the native mic is free.
         stopPassiveAudioRecord()
+        waitForWakeCandidateMic(rms, 0L)
+    }
 
+    private fun waitForWakeCandidateMic(rms: Float, elapsedMs: Long) {
+        if (isProcessingCommand || isSpeaking || !canRunBackgroundWakeWord()) return
+
+        if (!MicrophoneArbiter.tryAcquire(BACKGROUND_CANDIDATE_OWNER)) {
+            if (elapsedMs >= MIC_HANDOFF_TIMEOUT_MS) {
+                Log.w(tag, "Timed out waiting for microphone handoff to wake-word recognizer")
+                if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                return
+            }
+            mainHandler.postDelayed(
+                { waitForWakeCandidateMic(rms, elapsedMs + MIC_HANDOFF_POLL_MS) },
+                MIC_HANDOFF_POLL_MS
+            )
+            return
+        }
+
+        startWakeCandidateRecognizer(rms)
+    }
+
+    private fun startWakeCandidateRecognizer(rms: Float) {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
@@ -474,80 +521,76 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
         var tempRecognizer: SpeechRecognizer? = null
         var candidateHandled = false
+        var timeout: Runnable = Runnable { }
+
+        fun finishCandidate(resumePassive: Boolean) {
+            if (candidateHandled) return
+            candidateHandled = true
+            mainHandler.removeCallbacks(timeout)
+            runCatching { tempRecognizer?.cancel() }
+            runCatching { tempRecognizer?.destroy() }
+            MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
+            if (resumePassive && canRunBackgroundWakeWord() && !isProcessingCommand) {
+                startPassiveWakeWordListening()
+            }
+        }
+
         try {
-            tempRecognizer =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
-                ) {
-                    SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
-                } else {
-                    SpeechRecognizer.createSpeechRecognizer(this)
-                }
+            tempRecognizer = if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+            ) {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(this)
+            }
+
             tempRecognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
+                override fun onReadyForSpeech(params: Bundle?) = Unit
+                override fun onBeginningOfSpeech() = Unit
+                override fun onRmsChanged(rmsdB: Float) = Unit
+                override fun onBufferReceived(buffer: ByteArray?) = Unit
+                override fun onEndOfSpeech() = Unit
 
                 override fun onError(error: Int) {
-                    tempRecognizer?.destroy()
-                    // Silently resume passive listening without triggering activation or sound
-                    if (wakeWordEnabled && !isProcessingCommand) {
-                        startPassiveWakeWordListening()
-                    }
+                    Log.d(tag, "Wake candidate recognizer error: $error")
+                    finishCandidate(resumePassive = true)
                 }
 
                 override fun onResults(results: Bundle?) {
-                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    tempRecognizer?.destroy()
-
-                    if (!candidateHandled && !matches.isNullOrEmpty()) {
-                        candidateHandled = true
-                        val text = matches[0].trim().lowercase(Locale.ROOT)
+                    if (candidateHandled) return
+                    val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
+                    if (text.isNotBlank()) {
+                        finishCandidate(resumePassive = false)
                         processWakeWordCandidate(text, rms)
-                    } else if (!candidateHandled) {
-                        if (wakeWordEnabled && !isProcessingCommand) {
-                            startPassiveWakeWordListening()
-                        }
+                    } else {
+                        finishCandidate(resumePassive = true)
                     }
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
+                    if (candidateHandled) return
                     val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
-                    if (!candidateHandled && partial.isNotBlank()) {
-                        var best = 0f
-                        for (phrase in wakePhrases) best = maxOf(best, calculateWakeWordConfidence(partial, phrase))
+                    if (partial.isNotBlank()) {
+                        val best = wakePhrases.maxOfOrNull { calculateWakeWordConfidence(partial, it) } ?: 0f
                         if (best >= wakeWordConfidenceThreshold) {
-                            candidateHandled = true
-                            tempRecognizer?.cancel()
-                            tempRecognizer?.destroy()
+                            finishCandidate(resumePassive = false)
                             processWakeWordCandidate(partial, rms)
                         }
                     }
                 }
-                override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                override fun onEvent(eventType: Int, params: Bundle?) = Unit
             })
 
-            val timeout = Runnable {
-                if (!candidateHandled) {
-                    candidateHandled = true
-                    runCatching { tempRecognizer?.cancel() }
-                    runCatching { tempRecognizer?.destroy() }
-                    if (wakeWordEnabled && !isProcessingCommand && !backgroundVoicePausedForForeground) {
-                        startPassiveWakeWordListening()
-                    }
-                }
-            }
+            timeout = Runnable { finishCandidate(resumePassive = true) }
             mainHandler.postDelayed(timeout, 7000L)
             tempRecognizer.startListening(intent)
         } catch (e: Exception) {
-            Log.e(tag, "Error starting candidate speech check: ${e.message}")
-            tempRecognizer?.destroy()
-            if (wakeWordEnabled && !isProcessingCommand) {
-                startPassiveWakeWordListening()
-            }
+            Log.e(tag, "Error starting candidate speech check", e)
+            finishCandidate(resumePassive = true)
         }
     }
 
@@ -666,7 +709,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun startCommandListening() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             isProcessingCommand = false
-            if (wakeWordEnabled) startPassiveWakeWordListening()
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
             return
         }
 
@@ -680,13 +723,19 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         }
 
         try {
+            if (!MicrophoneArbiter.tryAcquire(BACKGROUND_MIC_OWNER)) {
+                isProcessingCommand = false
+                if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+                return
+            }
             speechRecognizer?.startListening(intent)
             isListening = true
             Log.d(tag, "Listening for user command")
         } catch (e: Exception) {
             Log.e(tag, "Error starting command listening", e)
+            MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
             isProcessingCommand = false
-            if (wakeWordEnabled) startPassiveWakeWordListening()
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
         }
     }
 
@@ -703,7 +752,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private suspend fun processCommand(commandText: String) {
         if (commandText.trim().isEmpty()) {
             isProcessingCommand = false
-            if (wakeWordEnabled) startPassiveWakeWordListening()
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
             return
         }
 
@@ -819,12 +868,27 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         }
         if (intent?.action == ACTION_RESUME_BACKGROUND_VOICE) {
             backgroundVoicePausedForForeground = false
-            if (wakeWordEnabled) startPassiveWakeWordListening()
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
             return START_STICKY
         }
         if (intent?.action == "STOP_SERVICE") {
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        // Settings such as wake-word/background-listening can be changed while this
+        // foreground service is already alive. Refresh them on every normal start
+        // command so disabling the toggle actually stops microphone capture.
+        scope.launch {
+            val repo = repository ?: return@launch
+            wakeWordEnabled = repo.getSetting("wake_word_enabled", "false").toBoolean()
+            backgroundListeningEnabled = repo.getSetting("background_listening_enabled", "false").toBoolean()
+            backgroundServiceEnabled = repo.getSetting("background_service", "false").toBoolean()
+            if (canRunBackgroundWakeWord()) {
+                startPassiveWakeWordListening()
+            } else {
+                stopPassiveAudioRecord()
+            }
         }
         return START_STICKY
     }
@@ -860,6 +924,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         mainHandler.removeCallbacksAndMessages(null)
         passiveListeningJob?.cancel()
         stopPassiveAudioRecord()
+        MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
         speechRecognizer?.destroy()
         textToSpeech?.shutdown()
         scope.launch {

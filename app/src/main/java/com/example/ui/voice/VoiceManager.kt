@@ -54,6 +54,9 @@ class VoiceManager(
     private val MAX_SESSION_MS = 90_000L
     private val MAX_RETRIES = 5
     private val RETRY_DELAY_MS = 280L
+    private val MIC_HANDOFF_TIMEOUT_MS = 2500L
+    private val MIC_HANDOFF_POLL_MS = 100L
+    private val MANUAL_MIC_OWNER = "manual_voice"
 
     private val sessionGuard = Runnable {
         if (listening && System.currentTimeMillis() - sessionStartedAt >= MAX_SESSION_MS) {
@@ -168,8 +171,8 @@ class VoiceManager(
                     return
                 }
 
-                finishListening(null, resume = true)
-                onFinalSpeech(text)
+                finishListening(null, resume = false)
+                runCatching { onFinalSpeech(text) }
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
@@ -201,22 +204,40 @@ class VoiceManager(
             retryCount = 0
             sessionStartedAt = System.currentTimeMillis()
             sessionStarting = true
-            // Give the background AudioRecord a moment to stop and release its
-            // native audio resources before SpeechRecognizer requests the mic.
-            mainHandler.postDelayed({
-                if (!shuttingDown && !listening) {
-                    sessionStarting = false
-                    startRecognizerSession()
-                } else {
-                    sessionStarting = false
-                }
-            }, 120L)
+            // Pause the background listener first, then wait until its AudioRecord
+            // has actually released the native microphone before SpeechRecognizer
+            // is allowed to start. A fixed 120 ms delay was not reliable on real
+            // devices and could trigger a native audio crash / ANR.
+            waitForMicrophoneAndStart(0L)
         }
     }
 
+    private fun waitForMicrophoneAndStart(elapsedMs: Long) {
+        if (shuttingDown || !sessionStarting) return
+
+        if (MicrophoneArbiter.tryAcquire(MANUAL_MIC_OWNER)) {
+            sessionStarting = false
+            startRecognizerSession()
+            return
+        }
+
+        if (elapsedMs >= MIC_HANDOFF_TIMEOUT_MS) {
+            sessionStarting = false
+            finishListening("The microphone is still in use by another Baby voice session. Please try again.", resume = true)
+            return
+        }
+
+        mainHandler.postDelayed(
+            { waitForMicrophoneAndStart(elapsedMs + MIC_HANDOFF_POLL_MS) },
+            MIC_HANDOFF_POLL_MS
+        )
+    }
+
     private fun startRecognizerSession() {
-        sessionStarting = false
-        if (shuttingDown) return
+        if (shuttingDown) {
+            MicrophoneArbiter.release(MANUAL_MIC_OWNER)
+            return
+        }
         try {
             recognizer?.cancel()
             recognizer?.destroy()
@@ -279,10 +300,11 @@ class VoiceManager(
         try { recognizer?.cancel() } catch (_: Exception) { }
         try { recognizer?.destroy() } catch (_: Exception) { }
         recognizer = null
+        MicrophoneArbiter.release(MANUAL_MIC_OWNER)
         onListeningStateChanged(false)
         onPartialSpeech("")
         if (resume && wasListening && allowBackgroundResume) resumeBackgroundVoice()
-        if (!errorMessage.isNullOrBlank()) onErrorSpeech(errorMessage)
+        if (!errorMessage.isNullOrBlank()) runCatching { onErrorSpeech(errorMessage) }
     }
 
     private fun pauseBackgroundVoice() {
@@ -294,6 +316,12 @@ class VoiceManager(
     private fun resumeBackgroundVoice() {
         runCatching {
             context.sendBroadcast(Intent(BabyAssistantService.ACTION_RESUME_BACKGROUND_VOICE).setPackage(context.packageName))
+        }
+    }
+
+    fun resumeBackgroundIfAllowed() {
+        if (allowBackgroundResume && !shuttingDown) {
+            resumeBackgroundVoice()
         }
     }
 
@@ -316,17 +344,17 @@ class VoiceManager(
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = onTtsStart()
                 override fun onDone(utteranceId: String?) {
-                    resumeBackgroundVoice()
-                    onTtsDone()
+                    if (allowBackgroundResume) resumeBackgroundVoice()
+                    runCatching { onTtsDone() }
                 }
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
-                    resumeBackgroundVoice()
-                    onTtsDone()
+                    if (allowBackgroundResume) resumeBackgroundVoice()
+                    runCatching { onTtsDone() }
                 }
                 override fun onError(utteranceId: String?, errorCode: Int) {
-                    resumeBackgroundVoice()
-                    onTtsDone()
+                    if (allowBackgroundResume) resumeBackgroundVoice()
+                    runCatching { onTtsDone() }
                 }
             })
             onTtsInitialized()
@@ -367,6 +395,9 @@ class VoiceManager(
         shuttingDown = true
         finishListening(null, resume = false)
         mainHandler.removeCallbacks(cacheCleanup)
+        mainHandler.removeCallbacks(sessionGuard)
+        sessionStarting = false
+        MicrophoneArbiter.release(MANUAL_MIC_OWNER)
         stopSpeaking()
         runCatching { textToSpeech?.shutdown() }
         textToSpeech = null

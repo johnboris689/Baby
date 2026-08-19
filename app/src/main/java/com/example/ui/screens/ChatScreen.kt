@@ -201,6 +201,8 @@ fun ChatScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .imePadding()
+                .navigationBarsPadding()
         ) {
             // Top Bar
             GlassCard(
@@ -338,8 +340,6 @@ fun ChatScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 14.dp, vertical = 6.dp)
-                    .navigationBarsPadding()
-                    .imePadding()
             ) {
                 Box(
                     modifier = Modifier

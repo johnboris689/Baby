@@ -422,6 +422,9 @@ class BabyViewModel(
                         _isDictating.value = false
                         _assistantState.value = AssistantState.IDLE
                         _dictatedText.emit(text)
+                        // Pure dictation does not trigger TTS, so explicitly hand the
+                        // microphone back to the background service when allowed.
+                        voiceManager?.resumeBackgroundIfAllowed()
                         return@launch
                     }
                     val normalized = text.trim().lowercase()
@@ -462,8 +465,13 @@ class BabyViewModel(
             },
             onTtsDone = {
                 _assistantState.value = AssistantState.IDLE
-                if (_isContinuousMode.value) {
-                    startListening() // Automatically listen again for continuous conversation!
+                if (_isContinuousMode.value && _isVoiceModeActive.value) {
+                    viewModelScope.launch {
+                        delay(250L)
+                        if (_isContinuousMode.value && _isVoiceModeActive.value) {
+                            startListening()
+                        }
+                    }
                 }
             },
             onTtsInitialized = {
@@ -1173,7 +1181,14 @@ class BabyViewModel(
                     _selectedVoiceName.value = value
                     voiceManager?.selectedVoiceName = value.ifEmpty { null }
                 }
-                "is_continuous_mode" -> _isContinuousMode.value = value.toBoolean()
+                "is_continuous_mode" -> {
+                    _isContinuousMode.value = value.toBoolean()
+                    if (!value.toBoolean() && _isVoiceModeActive.value) {
+                        _isVoiceModeActive.value = false
+                        voiceManager?.setBackgroundResumeAllowed(true)
+                        voiceManager?.stopListening()
+                    }
+                }
                 "silence_amplitude_threshold" -> {
                     val floatVal = value.toFloatOrNull() ?: 2.0f
                     _silenceThreshold.value = floatVal
