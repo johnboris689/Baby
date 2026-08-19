@@ -92,6 +92,9 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     private var backgroundServiceEnabled = false
     private val BACKGROUND_MIC_OWNER = "background_wake_word"
     private val BACKGROUND_CANDIDATE_OWNER = "background_wake_candidate"
+    private var wakeCandidateRecognizer: SpeechRecognizer? = null
+    private var wakeCandidateTimeout: Runnable? = null
+    private var wakeCandidateHandled = false
     private val MIC_HANDOFF_TIMEOUT_MS = 2500L
     private val MIC_HANDOFF_POLL_MS = 100L
 
@@ -114,6 +117,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             when (intent?.action) {
                 ACTION_PAUSE_BACKGROUND_VOICE -> {
                     backgroundVoicePausedForForeground = true
+                    cancelWakeCandidateRecognizer(resumePassive = false)
                     stopPassiveAudioRecord()
                     try { speechRecognizer?.cancel() } catch (_: Exception) { }
                     isListening = false
@@ -311,7 +315,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     // --- Passive AudioRecord Wake-Word Engine ---
 
     private fun canRunBackgroundWakeWord(): Boolean =
-        isActive && backgroundServiceEnabled && backgroundListeningEnabled && wakeWordEnabled && !backgroundVoicePausedForForeground
+        backgroundServiceEnabled && backgroundListeningEnabled && wakeWordEnabled && !backgroundVoicePausedForForeground
 
     private fun startPassiveWakeWordListening() {
         if (!canRunBackgroundWakeWord() || isPassiveListening || isProcessingCommand) return
@@ -510,7 +514,52 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         startWakeCandidateRecognizer(rms)
     }
 
+    private fun cancelWakeCandidateRecognizer(resumePassive: Boolean) {
+        mainHandler.removeCallbacks(wakeCandidateTimeout)
+        wakeCandidateTimeout = null
+        runCatching { wakeCandidateRecognizer?.cancel() }
+        runCatching { wakeCandidateRecognizer?.destroy() }
+        wakeCandidateRecognizer = null
+        wakeCandidateHandled = true
+        MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
+        if (resumePassive && canRunBackgroundWakeWord() && !isProcessingCommand) {
+            startPassiveWakeWordListening()
+        }
+    }
+
+    private fun finishWakeCandidate(resumePassive: Boolean) {
+        if (wakeCandidateHandled) return
+        wakeCandidateHandled = true
+        mainHandler.removeCallbacks(wakeCandidateTimeout)
+        wakeCandidateTimeout = null
+        runCatching { wakeCandidateRecognizer?.cancel() }
+        runCatching { wakeCandidateRecognizer?.destroy() }
+        wakeCandidateRecognizer = null
+        MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
+        if (resumePassive && canRunBackgroundWakeWord() && !isProcessingCommand) {
+            startPassiveWakeWordListening()
+        }
+    }
+
     private fun startWakeCandidateRecognizer(rms: Float) {
+        if (!canRunBackgroundWakeWord() || isProcessingCommand || isSpeaking) {
+            MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
+            return
+        }
+
+        // Never keep two candidate recognizers alive. This also makes a foreground
+        // microphone tap able to cancel a pending wake-word candidate cleanly.
+        if (wakeCandidateRecognizer != null) {
+            cancelWakeCandidateRecognizer(resumePassive = false)
+        }
+        // The caller already owns this arbiter slot, and tryAcquire is idempotent for
+        // the same owner. Re-acquire after the stale-candidate cleanup above.
+        if (!MicrophoneArbiter.tryAcquire(BACKGROUND_CANDIDATE_OWNER)) {
+            if (canRunBackgroundWakeWord()) startPassiveWakeWordListening()
+            return
+        }
+        wakeCandidateHandled = false
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (Locale.getDefault().language == "en") "en-US" else Locale.getDefault().toLanguageTag())
@@ -519,24 +568,8 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
         }
 
-        var tempRecognizer: SpeechRecognizer? = null
-        var candidateHandled = false
-        var timeout: Runnable = Runnable { }
-
-        fun finishCandidate(resumePassive: Boolean) {
-            if (candidateHandled) return
-            candidateHandled = true
-            mainHandler.removeCallbacks(timeout)
-            runCatching { tempRecognizer?.cancel() }
-            runCatching { tempRecognizer?.destroy() }
-            MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
-            if (resumePassive && canRunBackgroundWakeWord() && !isProcessingCommand) {
-                startPassiveWakeWordListening()
-            }
-        }
-
         try {
-            tempRecognizer = if (
+            wakeCandidateRecognizer = if (
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                 SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
             ) {
@@ -545,7 +578,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 SpeechRecognizer.createSpeechRecognizer(this)
             }
 
-            tempRecognizer.setRecognitionListener(object : RecognitionListener {
+            wakeCandidateRecognizer?.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) = Unit
                 override fun onBeginningOfSpeech() = Unit
                 override fun onRmsChanged(rmsdB: Float) = Unit
@@ -553,30 +586,31 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onEndOfSpeech() = Unit
 
                 override fun onError(error: Int) {
+                    if (wakeCandidateHandled) return
                     Log.d(tag, "Wake candidate recognizer error: $error")
-                    finishCandidate(resumePassive = true)
+                    finishWakeCandidate(resumePassive = true)
                 }
 
                 override fun onResults(results: Bundle?) {
-                    if (candidateHandled) return
+                    if (wakeCandidateHandled) return
                     val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
                     if (text.isNotBlank()) {
-                        finishCandidate(resumePassive = false)
+                        finishWakeCandidate(resumePassive = false)
                         processWakeWordCandidate(text, rms)
                     } else {
-                        finishCandidate(resumePassive = true)
+                        finishWakeCandidate(resumePassive = true)
                     }
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
-                    if (candidateHandled) return
+                    if (wakeCandidateHandled) return
                     val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()?.trim().orEmpty().lowercase(Locale.ROOT)
                     if (partial.isNotBlank()) {
                         val best = wakePhrases.maxOfOrNull { calculateWakeWordConfidence(partial, it) } ?: 0f
                         if (best >= wakeWordConfidenceThreshold) {
-                            finishCandidate(resumePassive = false)
+                            finishWakeCandidate(resumePassive = false)
                             processWakeWordCandidate(partial, rms)
                         }
                     }
@@ -585,12 +619,12 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onEvent(eventType: Int, params: Bundle?) = Unit
             })
 
-            timeout = Runnable { finishCandidate(resumePassive = true) }
-            mainHandler.postDelayed(timeout, 7000L)
-            tempRecognizer.startListening(intent)
+            wakeCandidateTimeout = Runnable { finishWakeCandidate(resumePassive = true) }
+            mainHandler.postDelayed(wakeCandidateTimeout, 7000L)
+            wakeCandidateRecognizer?.startListening(intent)
         } catch (e: Exception) {
             Log.e(tag, "Error starting candidate speech check", e)
-            finishCandidate(resumePassive = true)
+            finishWakeCandidate(resumePassive = true)
         }
     }
 
@@ -922,9 +956,11 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             Log.e(tag, "Failed to unregister notification receiver", e)
         }
         mainHandler.removeCallbacksAndMessages(null)
+        cancelWakeCandidateRecognizer(resumePassive = false)
         passiveListeningJob?.cancel()
         stopPassiveAudioRecord()
         MicrophoneArbiter.release(BACKGROUND_MIC_OWNER)
+        MicrophoneArbiter.release(BACKGROUND_CANDIDATE_OWNER)
         speechRecognizer?.destroy()
         textToSpeech?.shutdown()
         scope.launch {
