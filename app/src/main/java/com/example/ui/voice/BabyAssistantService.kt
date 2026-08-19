@@ -18,6 +18,8 @@ import android.media.MediaRecorder
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.IBinder
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -67,6 +69,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
     @Volatile private var passiveGeneration = 0L
 
     private val scope = CoroutineScope(Dispatchers.Main + Job())
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var repository: BabyRepository? = null
     private var deviceControlManager: DeviceControlManager? = null
     private var routingEngine: CommandRoutingEngine? = null
@@ -106,6 +109,8 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 ACTION_PAUSE_BACKGROUND_VOICE -> {
                     backgroundVoicePausedForForeground = true
                     stopPassiveAudioRecord()
+                    try { speechRecognizer?.cancel() } catch (_: Exception) { }
+                    isListening = false
                     updateNotificationText("BabyAI: Background mic paused for chat")
                 }
                 ACTION_RESUME_BACKGROUND_VOICE -> {
@@ -390,37 +395,58 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     if (now < suppressionUntilMs || now - lastTriggerTimeMs < DEBOUNCE_WINDOW_MS) continue
 
                     withContext(Dispatchers.Main) {
-                        if (generation == passiveGeneration && !isProcessingCommand && !isSpeaking) {
+                        if (generation == passiveGeneration && !isProcessingCommand && !isSpeaking && !backgroundVoicePausedForForeground) {
                             evaluateSpeechCandidate(rms)
                         }
                     }
                     delay(500)
                 }
             } catch (e: Exception) {
-                if (generation == passiveGeneration) {
-                    Log.e(tag, "Passive wake-word listener stopped: ${e.message}")
+                if (generation == passiveGeneration && e !is kotlinx.coroutines.CancellationException) {
+                    Log.e(tag, "Passive wake-word listener stopped: ${e.message}", e)
                 }
             } finally {
-                stopPassiveAudioRecord(generation)
+                // Release AudioRecord on the same worker that owns the blocking read.
+                // Releasing it from the main thread while read() is active can race the
+                // native audio stack and is a common cause of microphone-related crashes.
+                releasePassiveRecorder(recorder)
             }
         }
     }
 
     private fun stopPassiveAudioRecord(expectedGeneration: Long? = null) {
         if (expectedGeneration != null && expectedGeneration != passiveGeneration) return
+
         if (expectedGeneration == null) {
+            passiveGeneration++
+            isPassiveListening = false
             passiveListeningJob?.cancel()
             passiveListeningJob = null
         }
-        passiveGeneration++
-        isPassiveListening = false
+
+        // Stop the active read, but do NOT release the recorder from this thread.
+        // The owning IO coroutine releases it in finally{} after read() returns.
         val recorder = audioRecord
-        audioRecord = null
+        if (recorder != null) {
+            try {
+                recorder.stop()
+            } catch (_: Exception) {
+                // Already stopped; the owner will still release it safely.
+            }
+        }
+    }
+
+    private fun releasePassiveRecorder(recorder: AudioRecord) {
+        if (audioRecord === recorder) {
+            audioRecord = null
+        }
         try {
-            recorder?.stop()
+            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                recorder.stop()
+            }
         } catch (_: Exception) { }
         try {
-            recorder?.release()
+            recorder.release()
         } catch (e: Exception) {
             Log.e(tag, "Error releasing AudioRecord", e)
         }
@@ -498,6 +524,17 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
+            val timeout = Runnable {
+                if (!candidateHandled) {
+                    candidateHandled = true
+                    runCatching { tempRecognizer?.cancel() }
+                    runCatching { tempRecognizer?.destroy() }
+                    if (wakeWordEnabled && !isProcessingCommand && !backgroundVoicePausedForForeground) {
+                        startPassiveWakeWordListening()
+                    }
+                }
+            }
+            mainHandler.postDelayed(timeout, 7000L)
             tempRecognizer.startListening(intent)
         } catch (e: Exception) {
             Log.e(tag, "Error starting candidate speech check: ${e.message}")
@@ -814,6 +851,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         } catch (e: Exception) {
             Log.e(tag, "Failed to unregister notification receiver", e)
         }
+        mainHandler.removeCallbacksAndMessages(null)
         passiveListeningJob?.cancel()
         stopPassiveAudioRecord()
         speechRecognizer?.destroy()

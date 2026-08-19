@@ -24,12 +24,14 @@ import com.example.ui.screens.ChatScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.MemoryScreen
 import com.example.ui.screens.SettingsScreen
+import com.example.ui.screens.TranslationScreen
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.viewmodel.BabyViewModel
 
 enum class Screen {
     Home,
     Chat,
+    Translate,
     Memory,
     Settings
 }
@@ -91,10 +93,16 @@ class MainActivity : ComponentActivity() {
                             viewModel = viewModel,
                             onNavigateToChat = { currentScreen = Screen.Chat },
                             onNavigateToMemory = { currentScreen = Screen.Memory },
+                            onNavigateToTranslate = { currentScreen = Screen.Translate },
                             onNavigateToSettings = { currentScreen = Screen.Settings },
                             modifier = Modifier.padding(innerPadding)
                         )
                         Screen.Chat -> ChatScreen(
+                            viewModel = viewModel,
+                            onNavigateBack = { currentScreen = Screen.Home },
+                            modifier = Modifier.padding(innerPadding)
+                        )
+                        Screen.Translate -> TranslationScreen(
                             viewModel = viewModel,
                             onNavigateBack = { currentScreen = Screen.Home },
                             modifier = Modifier.padding(innerPadding)

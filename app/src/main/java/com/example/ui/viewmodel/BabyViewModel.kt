@@ -37,6 +37,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
+import androidx.compose.ui.graphics.Color
+import com.example.ui.theme.BabyBlue
+import com.example.ui.theme.BabyCyan
+import com.example.ui.theme.BabyGreen
+import com.example.ui.theme.BabyViolet
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -53,6 +58,23 @@ enum class AssistantState {
     SPEAKING
 }
 
+enum class BabyConnectionState {
+    ONLINE,               // Internet connected AND API key is configured
+    OFFLINE_NO_KEY,       // Missing/unconfigured Gemini API Key
+    OFFLINE_NO_INTERNET,  // API Key exists, but no active network
+    OFFLINE_UNCONFIGURED  // No internet and no API key
+}
+
+data class BabyStatus(
+    val connectionState: BabyConnectionState,
+    val assistantState: AssistantState,
+    val isOnline: Boolean,
+    val statusText: String,
+    val indicatorColor: Color,
+    val isKeyConfigured: Boolean,
+    val isInternetAvailable: Boolean
+)
+
 class BabyViewModel(
     application: Application,
     private val repository: BabyRepository
@@ -67,6 +89,15 @@ class BabyViewModel(
 
     private val _moodSignal = MutableStateFlow(MoodSignal(UserEmotion.NEUTRAL, 0.0f, "warm"))
     val moodSignal: StateFlow<MoodSignal> = _moodSignal.asStateFlow()
+
+    private val _isVoiceModeActive = MutableStateFlow(false)
+    val isVoiceModeActive: StateFlow<Boolean> = _isVoiceModeActive.asStateFlow()
+
+    private val _isDictating = MutableStateFlow(false)
+    val isDictating: StateFlow<Boolean> = _isDictating.asStateFlow()
+
+    private val _dictatedText = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val dictatedText: SharedFlow<String> = _dictatedText.asSharedFlow()
 
     private val _partialSpeechText = MutableStateFlow("")
     val partialSpeechText: StateFlow<String> = _partialSpeechText.asStateFlow()
@@ -119,6 +150,71 @@ class BabyViewModel(
 
     private val _apiKey = MutableStateFlow("")
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
+
+    val isApiKeyConfigured: StateFlow<Boolean> = _apiKey
+        .map { key ->
+            val resolved = key.ifEmpty { BuildConfig.GEMINI_API_KEY }.trim()
+            resolved.isNotEmpty() && resolved != "MY_GEMINI_API_KEY" && !resolved.startsWith("YOUR_")
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    val babyStatus: StateFlow<BabyStatus> = combine(
+        _isInternetAvailable,
+        isApiKeyConfigured,
+        _assistantState
+    ) { internet, hasKey, state ->
+        val isOnline = internet && hasKey
+        val connectionState = when {
+            internet && hasKey -> BabyConnectionState.ONLINE
+            !hasKey && internet -> BabyConnectionState.OFFLINE_NO_KEY
+            hasKey && !internet -> BabyConnectionState.OFFLINE_NO_INTERNET
+            else -> BabyConnectionState.OFFLINE_UNCONFIGURED
+        }
+
+        val defaultText = when (connectionState) {
+            BabyConnectionState.ONLINE -> "Online • Ready"
+            BabyConnectionState.OFFLINE_NO_KEY -> "Offline • Key Required"
+            BabyConnectionState.OFFLINE_NO_INTERNET -> "Offline • No Network"
+            BabyConnectionState.OFFLINE_UNCONFIGURED -> "Offline • Unconfigured"
+        }
+
+        val statusText = when (state) {
+            AssistantState.LISTENING -> "Listening..."
+            AssistantState.THINKING -> "Thinking..."
+            AssistantState.SPEAKING -> "Speaking..."
+            AssistantState.IDLE -> defaultText
+        }
+
+        val indicatorColor = when {
+            state == AssistantState.LISTENING -> BabyCyan
+            state == AssistantState.THINKING -> BabyViolet
+            state == AssistantState.SPEAKING -> BabyBlue
+            isOnline -> BabyGreen
+            else -> Color(0xFFF59E0B)
+        }
+
+        BabyStatus(
+            connectionState = connectionState,
+            assistantState = state,
+            isOnline = isOnline,
+            statusText = statusText,
+            indicatorColor = indicatorColor,
+            isKeyConfigured = hasKey,
+            isInternetAvailable = internet
+        )
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.Eagerly,
+        BabyStatus(
+            connectionState = BabyConnectionState.OFFLINE_UNCONFIGURED,
+            assistantState = AssistantState.IDLE,
+            isOnline = false,
+            statusText = "Offline",
+            indicatorColor = Color(0xFFF59E0B),
+            isKeyConfigured = false,
+            isInternetAvailable = false
+        )
+    )
 
     private val _geminiModel = MutableStateFlow("gemini-3.6-flash")
     val geminiModel: StateFlow<String> = _geminiModel.asStateFlow()
@@ -322,6 +418,12 @@ class BabyViewModel(
                 _partialSpeechText.value = ""
                 _moodSignal.value = MoodRadar.detect(text, _rmsDb.value)
                 viewModelScope.launch {
+                    if (_isDictating.value) {
+                        _isDictating.value = false
+                        _assistantState.value = AssistantState.IDLE
+                        _dictatedText.emit(text)
+                        return@launch
+                    }
                     val normalized = text.trim().lowercase()
                     val wakeOnly = normalized.matches(Regex("(?:hey|hi|hello)\\s+baby[.!?]*")) || normalized == "baby"
                     val stripped = normalized.replace(Regex("^(hey|hi|hello)\\s+baby\\s*[,!?.-]*\\s*"), "").trim()
@@ -335,6 +437,7 @@ class BabyViewModel(
             },
             onErrorSpeech = { err ->
                 _partialSpeechText.value = ""
+                _isDictating.value = false
                 _assistantState.value = AssistantState.IDLE
                 viewModelScope.launch {
                     repository.addLog("Voice", "STT Error: $err")
@@ -544,6 +647,36 @@ class BabyViewModel(
             repository.deleteRule(id)
             repository.addLog("Automation", "Deleted rule")
         }
+    }
+
+    // --- Neural Translation Engine ---
+    private val _translationResult = MutableStateFlow("")
+    val translationResult: StateFlow<String> = _translationResult.asStateFlow()
+
+    private val _isTranslating = MutableStateFlow(false)
+    val isTranslating: StateFlow<Boolean> = _isTranslating.asStateFlow()
+
+    fun translate(text: String, sourceLang: String, targetLang: String) {
+        if (text.isBlank()) {
+            _translationResult.value = ""
+            return
+        }
+        viewModelScope.launch {
+            _isTranslating.value = true
+            try {
+                val prompt = "Translate the following text from $sourceLang to $targetLang accurately, naturally preserving context and tone. Output ONLY the translation directly without any explanation, quotes or preamble:\n\n$text"
+                val res = callOnlineAI(prompt, emptyList(), emptyList())
+                _translationResult.value = res.trim()
+            } catch (e: Exception) {
+                _translationResult.value = "Translation error: ${e.message ?: "Network timeout"}"
+            } finally {
+                _isTranslating.value = false
+            }
+        }
+    }
+
+    fun clearTranslation() {
+        _translationResult.value = ""
     }
 
     private fun checkAutomationTriggers(triggerType: String) {
@@ -943,7 +1076,39 @@ class BabyViewModel(
 
     // --- Speech Control Methods ---
 
+    fun startDictation() {
+        _isDictating.value = true
+        _isVoiceModeActive.value = false
+        _isContinuousMode.value = false
+        voiceManager?.setBackgroundResumeAllowed(true)
+        voiceManager?.startListening()
+    }
+
+    fun stopDictation() {
+        _isDictating.value = false
+        voiceManager?.setBackgroundResumeAllowed(true)
+        voiceManager?.stopListening()
+        _assistantState.value = AssistantState.IDLE
+    }
+
+    fun enterVoiceMode() {
+        _isDictating.value = false
+        _isVoiceModeActive.value = true
+        _isContinuousMode.value = true
+        voiceManager?.setBackgroundResumeAllowed(false)
+        startListening()
+    }
+
+    fun exitVoiceMode() {
+        _isVoiceModeActive.value = false
+        _isContinuousMode.value = false
+        voiceManager?.setBackgroundResumeAllowed(true)
+        stopListening()
+        stopSpeaking()
+    }
+
     fun startListening() {
+        voiceManager?.setBackgroundResumeAllowed(!_isVoiceModeActive.value)
         voiceManager?.startListening()
     }
 

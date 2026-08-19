@@ -1,11 +1,13 @@
 package com.example.data.model
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.zip.ZipInputStream
 
@@ -105,6 +107,27 @@ object AttachmentHandler {
         } catch (e: Exception) {
             Attachment(uri, name, mimeType, effectiveSize,
                 extractedText = "Local inspection failed for $name: ${e.message ?: "unknown error"}. Baby will still try the original attachment.")
+        }
+    }
+
+    fun processBitmap(context: Context, bitmap: Bitmap, fileName: String = "photo_${System.currentTimeMillis()}.jpg"): Attachment? {
+        return try {
+            val cacheFile = File(context.cacheDir, fileName)
+            val stream = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+            val bytes = stream.toByteArray()
+            FileOutputStream(cacheFile).use { it.write(bytes) }
+            val uri = Uri.fromFile(cacheFile)
+            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            Attachment(
+                uri = uri,
+                name = fileName,
+                mimeType = "image/jpeg",
+                sizeBytes = bytes.size.toLong(),
+                base64Data = base64
+            )
+        } catch (e: Exception) {
+            null
         }
     }
 

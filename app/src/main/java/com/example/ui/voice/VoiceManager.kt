@@ -41,10 +41,15 @@ class VoiceManager(
     private var textToSpeech: TextToSpeech? = null
     private var ttsReady = false
     private var listening = false
+    private var sessionStarting = false
     private var retryCount = 0
     private var sessionStartedAt = 0L
     private var lastPartialAt = 0L
     private var shuttingDown = false
+    // When true, manual voice sessions may safely hand the microphone back to the
+    // background wake-word service. Continuous conversation keeps the background
+    // service paused so two microphone owners can never race each other.
+    private var allowBackgroundResume = true
 
     private val MAX_SESSION_MS = 90_000L
     private val MAX_RETRIES = 5
@@ -84,32 +89,29 @@ class VoiceManager(
     }
 
     private fun createRecognizer(): SpeechRecognizer? {
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) return null
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            Log.w(tag, "SpeechRecognizer.isRecognitionAvailable is false")
+            return null
+        }
         return try {
-            // Prefer the on-device recognizer when the phone exposes one: it avoids
-            // network stalls and is considerably faster for short wake/command phrases.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
-            ) {
-                SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-            } else {
-                SpeechRecognizer.createSpeechRecognizer(context)
-            }
+            SpeechRecognizer.createSpeechRecognizer(context)
         } catch (e: Exception) {
-            Log.w(tag, "Preferred recognizer unavailable: ${e.message}")
-            runCatching { SpeechRecognizer.createSpeechRecognizer(context) }.getOrNull()
+            Log.w(tag, "Failed to create speech recognizer: ${e.message}")
+            null
         }
     }
 
     private fun configureRecognizer() {
         recognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
+                Log.d(tag, "SpeechRecognizer onReadyForSpeech")
                 listening = true
                 onListeningStateChanged(true)
                 lastPartialAt = System.currentTimeMillis()
             }
 
             override fun onBeginningOfSpeech() {
+                Log.d(tag, "SpeechRecognizer onBeginningOfSpeech")
                 lastPartialAt = System.currentTimeMillis()
             }
 
@@ -121,56 +123,58 @@ class VoiceManager(
             override fun onBufferReceived(buffer: ByteArray?) = Unit
 
             override fun onEndOfSpeech() {
-                // Do NOT flip the UI back to idle here. Android often delivers onResults shortly after onEndOfSpeech.
+                Log.d(tag, "SpeechRecognizer onEndOfSpeech")
                 lastPartialAt = System.currentTimeMillis()
             }
 
             override fun onError(error: Int) {
-                Log.w(tag, "SpeechRecognizer error=$error retry=$retryCount")
-                val retryable = error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
-                    error == SpeechRecognizer.ERROR_NO_MATCH ||
-                    error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
-                    error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT ||
-                    error == SpeechRecognizer.ERROR_CLIENT ||
-                    error == SpeechRecognizer.ERROR_SERVER
+                Log.w(tag, "SpeechRecognizer onError code=$error, retryCount=$retryCount")
+                if (shuttingDown) return
 
-                if (listening && retryable && retryCount < MAX_RETRIES && !shuttingDown) {
+                val isTransient = (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                    error == SpeechRecognizer.ERROR_NO_MATCH ||
+                    error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) && retryCount < 2
+
+                if (listening && isTransient) {
                     retryCount++
                     mainHandler.postDelayed({ restartListeningAfterError() }, RETRY_DELAY_MS)
                     return
                 }
 
                 val message = when (error) {
-                    SpeechRecognizer.ERROR_AUDIO -> "The microphone could not be opened."
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission is required."
-                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech service could not be reached."
-                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "I didn't catch that. Please try again."
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Voice input was busy. Please try again."
-                    else -> "Voice input stopped unexpectedly."
+                    SpeechRecognizer.ERROR_AUDIO -> "Audio capture error. Please check microphone."
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission required."
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network connection needed for speech recognition."
+                    SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected. Tap mic to speak."
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected before timeout."
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Microphone was busy. Please try again."
+                    SpeechRecognizer.ERROR_SERVER -> "Speech server error. Please try again."
+                    else -> "Speech recognition ended."
                 }
                 finishListening(message, resume = true)
             }
 
             override fun onResults(results: Bundle?) {
-                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()?.trim().orEmpty()
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                Log.d(tag, "SpeechRecognizer onResults: '$text'")
                 if (text.isBlank()) {
-                    if (retryCount < MAX_RETRIES) {
+                    if (retryCount < 1) {
                         retryCount++
                         mainHandler.postDelayed({ restartListeningAfterError() }, RETRY_DELAY_MS)
                     } else {
-                        finishListening("I didn't catch that. Please try again.", resume = true)
+                        finishListening("No speech recognized. Tap mic to try again.", resume = true)
                     }
                     return
                 }
 
-                finishListening(null, resume = false)
+                finishListening(null, resume = true)
                 onFinalSpeech(text)
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
-                val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()?.trim().orEmpty()
+                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
                 if (text.isNotBlank()) {
                     lastPartialAt = System.currentTimeMillis()
                     onPartialSpeech(text)
@@ -181,28 +185,47 @@ class VoiceManager(
         })
     }
 
-    fun startListening() {
-        if (shuttingDown || listening) return
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            onErrorSpeech("Microphone permission is required.")
-            return
-        }
+    fun setBackgroundResumeAllowed(allowed: Boolean) {
+        allowBackgroundResume = allowed
+    }
 
-        pauseBackgroundVoice()
-        retryCount = 0
-        sessionStartedAt = System.currentTimeMillis()
-        startRecognizerSession()
+    fun startListening() {
+        mainHandler.post {
+            if (shuttingDown || listening || sessionStarting) return@post
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                onErrorSpeech("Microphone permission is required.")
+                return@post
+            }
+
+            pauseBackgroundVoice()
+            retryCount = 0
+            sessionStartedAt = System.currentTimeMillis()
+            sessionStarting = true
+            // Give the background AudioRecord a moment to stop and release its
+            // native audio resources before SpeechRecognizer requests the mic.
+            mainHandler.postDelayed({
+                if (!shuttingDown && !listening) {
+                    sessionStarting = false
+                    startRecognizerSession()
+                } else {
+                    sessionStarting = false
+                }
+            }, 120L)
+        }
     }
 
     private fun startRecognizerSession() {
+        sessionStarting = false
         if (shuttingDown) return
         try {
             recognizer?.cancel()
             recognizer?.destroy()
         } catch (_: Exception) { }
+        recognizer = null
+
         recognizer = createRecognizer()
         if (recognizer == null) {
-            finishListening("Speech recognition is not available on this phone.", resume = true)
+            finishListening("Speech recognition is unavailable on this device.", resume = true)
             return
         }
         configureRecognizer()
@@ -214,18 +237,18 @@ class VoiceManager(
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
         }
 
         try {
-            recognizer?.startListening(intent)
             listening = true
             onListeningStateChanged(true)
+            recognizer?.startListening(intent)
             mainHandler.removeCallbacks(sessionGuard)
             mainHandler.postDelayed(sessionGuard, MAX_SESSION_MS)
         } catch (e: Exception) {
             Log.e(tag, "Unable to start recognizer", e)
-            finishListening("I couldn't start the microphone. Please try again.", resume = true)
+            finishListening("Could not start microphone. Please try again.", resume = true)
         }
     }
 
@@ -239,7 +262,7 @@ class VoiceManager(
     }
 
     fun stopListening() {
-        if (!listening) return
+        if (!listening && !sessionStarting) return
         finishListening(null, resume = true)
     }
 
@@ -249,7 +272,8 @@ class VoiceManager(
     }
 
     private fun finishListening(errorMessage: String?, resume: Boolean) {
-        val wasListening = listening
+        val wasListening = listening || sessionStarting
+        sessionStarting = false
         listening = false
         mainHandler.removeCallbacks(sessionGuard)
         try { recognizer?.cancel() } catch (_: Exception) { }
@@ -257,7 +281,7 @@ class VoiceManager(
         recognizer = null
         onListeningStateChanged(false)
         onPartialSpeech("")
-        if (resume && wasListening) resumeBackgroundVoice()
+        if (resume && wasListening && allowBackgroundResume) resumeBackgroundVoice()
         if (!errorMessage.isNullOrBlank()) onErrorSpeech(errorMessage)
     }
 
