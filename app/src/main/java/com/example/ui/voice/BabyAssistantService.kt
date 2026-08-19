@@ -318,6 +318,8 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
             val bufferSize = maxOf(minBufferSize, 4096)
 
+            var recorderForRelease: AudioRecord? = null
+
             try {
                 val recorder = AudioRecord(
                     MediaRecorder.AudioSource.VOICE_RECOGNITION,
@@ -327,14 +329,18 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                     bufferSize
                 )
 
+                recorderForRelease = recorder
+
                 if (generation != passiveGeneration) {
                     recorder.release()
+                    recorderForRelease = null
                     return@launch
                 }
 
                 if (recorder.state != AudioRecord.STATE_INITIALIZED) {
                     Log.e(tag, "AudioRecord failed to initialize")
                     recorder.release()
+                    recorderForRelease = null
                     return@launch
                 }
 
@@ -409,7 +415,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
                 // Release AudioRecord on the same worker that owns the blocking read.
                 // Releasing it from the main thread while read() is active can race the
                 // native audio stack and is a common cause of microphone-related crashes.
-                releasePassiveRecorder(recorder)
+                recorderForRelease?.let { releasePassiveRecorder(it) }
             }
         }
     }
