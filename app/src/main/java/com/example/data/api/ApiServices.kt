@@ -85,11 +85,22 @@ interface GeminiApiService {
 object ApiClients {
     private const val GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/"
 
+    // Resilient OkHttpClient configured specifically for weak, low-bandwidth, and unstable mobile connections
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(16, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
-        .callTimeout(20, TimeUnit.SECONDS)
+        .connectionPool(okhttp3.ConnectionPool(5, 5, TimeUnit.MINUTES))
+        .retryOnConnectionFailure(true)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(60, TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            val original = chain.request()
+            val request = original.newBuilder()
+                .header("Accept-Encoding", "gzip")
+                .header("User-Agent", "Baby-AI-Android/1.0")
+                .build()
+            chain.proceed(request)
+        }
         .build()
 
     private val moshi = Moshi.Builder()

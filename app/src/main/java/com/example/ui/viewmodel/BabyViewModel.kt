@@ -768,13 +768,7 @@ class BabyViewModel(
                     mapOf("role" to it.role, "content" to it.content)
                 }
 
-                val responseText = withTimeoutOrNull(18_000L) {
-                    callOnlineAI(finalPrompt, activeMsgHistory, attachments)
-                } ?: OfflineCompanionEngine.generateOfflineResponse(
-                    prompt = finalPrompt,
-                    memories = memories.value.take(18),
-                    emotion = EmotionDetector.detectEmotion(finalPrompt)
-                )
+                val responseText = callOnlineAI(finalPrompt, activeMsgHistory, attachments)
 
                 // Render the response immediately; do not add artificial typing latency.
                 simulateStreamingText(responseText, convId)
@@ -782,15 +776,31 @@ class BabyViewModel(
             } catch (e: kotlinx.coroutines.CancellationException) {
                 repository.addLog("AI", "Generation job cancelled/interrupted.")
                 throw e
+            } catch (e: retrofit2.HttpException) {
+                val errorMsg = when (e.code()) {
+                    401, 403 -> "Your Gemini API key appears invalid or expired. Please update it in Settings."
+                    429 -> "The AI service is temporarily busy. Please wait a moment and try again."
+                    in 500..599 -> "The AI service is temporarily unavailable. Please retry shortly."
+                    else -> "Unable to get an AI response (HTTP ${e.code()}). Please retry."
+                }
+                repository.addLog("AI_Error", "HTTP ${e.code()} from Gemini API: ${e.message}")
+                simulateStreamingText(errorMsg, convId)
+            } catch (e: java.net.SocketTimeoutException) {
+                repository.addLog("AI_Error", "Network timeout on weak connection: ${e.message}")
+                val timeoutMsg = "Your network connection is very slow and timed out. Give it a moment and try again."
+                simulateStreamingText(timeoutMsg, convId)
+            } catch (e: java.net.UnknownHostException) {
+                repository.addLog("AI_Error", "DNS/host resolution failed: ${e.message}")
+                val offlineMsg = "You're currently offline. Please check your network connection and retry."
+                simulateStreamingText(offlineMsg, convId)
+            } catch (e: java.io.IOException) {
+                repository.addLog("AI_Error", "Network I/O failure: ${e.message}")
+                val netMsg = "Connection was interrupted due to weak network. Please tap below to retry."
+                simulateStreamingText(netMsg, convId)
             } catch (e: Exception) {
-                repository.addLog("AI_Error", "Failed to generate online AI response: ${e.message}. Using offline companion logic.")
-                val detectedEmotion = EmotionDetector.detectEmotion(finalPrompt)
-                val offlineText = OfflineCompanionEngine.generateOfflineResponse(
-                    prompt = finalPrompt,
-                    memories = memories.value.take(18),
-                    emotion = detectedEmotion
-                )
-                simulateStreamingText(offlineText, convId)
+                repository.addLog("AI_Error", "Failed to generate AI response: ${e.message}")
+                val genericMsg = "I couldn't complete the request right now. Please check your connection and retry."
+                simulateStreamingText(genericMsg, convId)
             } finally {
                 // ZIP media is materialized only for the current request; remove it after the request finishes.
                 attachments.flatMap { it.extractedMedia }.forEach { media ->
@@ -847,29 +857,20 @@ class BabyViewModel(
         val detectedEmotion = EmotionDetector.detectEmotion(prompt)
         val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
 
-        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY" || !_isInternetAvailable.value) {
-            return@withContext OfflineCompanionEngine.generateOfflineResponse(
-                prompt = prompt,
-                memories = memories.value,
-                emotion = detectedEmotion
-            )
+        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
+            return@withContext "Please enter your Gemini API Key in Settings to enable AI responses."
         }
 
         repository.addLog("AI_Call", "Calling Gemini API with ${attachments.size} attachments...")
 
-        // Fast local memory retrieval: avoid an extra network embedding round-trip on every chat message.
-        // Existing embeddings are still generated in the background and can be used later for offline ranking.
-        val maxMemories = if (_isPowerSaveActive.value) 4 else 10
+        // Lightweight memory selection: retrieve top 4 distinct memories to keep payload small
+        val maxMemories = if (_isPowerSaveActive.value) 2 else 4
         val keywordMemories = repository.searchMemories(prompt, maxMemories)
-        val importantMemories = repository.getRecentImportantMemories(if (_isPowerSaveActive.value) 4 else 10)
+        val importantMemories = repository.getRecentImportantMemories(maxMemories)
         val selectedMemories = (keywordMemories + importantMemories)
             .distinctBy { it.content }
             .sortedWith(compareByDescending<MemoryEntity> { it.importance }.thenByDescending { it.timestamp })
-            .take(18)
-
-        val memoryContext = if (selectedMemories.isNotEmpty()) {
-            "Relevant user memories to remember:\n" + selectedMemories.joinToString("\n") { "- ${it.content}" } + "\n\n"
-        } else ""
+            .take(4)
 
         val memoryList = selectedMemories
         val currentMood = MoodRadar.detect(prompt, _rmsDb.value)
@@ -890,13 +891,15 @@ class BabyViewModel(
 
         val contents = mutableListOf<GeminiContent>()
 
-        // Append historical turns
-        val maxHistory = if (_isPowerSaveActive.value) 3 else 10
+        // Append historical turns (last 4 turns) with trimmed length on older messages to minimize bandwidth
+        val maxHistory = if (_isPowerSaveActive.value) 2 else 4
         history.takeLast(maxHistory).forEach { turn ->
+            val textContent = turn["content"] ?: ""
+            val trimmed = if (textContent.length > 300) textContent.take(300) + "..." else textContent
             contents.add(
                 GeminiContent(
                     role = if (turn["role"] == "user") "user" else "model",
-                    parts = listOf(GeminiPart(text = turn["content"] ?: ""))
+                    parts = listOf(GeminiPart(text = trimmed))
                 )
             )
         }
@@ -945,7 +948,7 @@ class BabyViewModel(
             }
         }
 
-        var finalPromptText = if (memoryContext.isNotEmpty()) "$memoryContext\nUser prompt: $prompt" else prompt
+        var finalPromptText = prompt
         if (docContext.isNotEmpty()) {
             finalPromptText += "\n\nAttached File Contents:\n$docContext"
         }
@@ -1037,47 +1040,15 @@ class BabyViewModel(
     // --- Automatic Long-Term Memory Extraction ---
 
     private fun extractMemoryInBackground(userMsg: String, assistantMsg: String) {
-        if (_isPowerSaveActive.value) {
-            Log.d("BabyViewModel", "Skipping background memory extraction during Power-Save Mode.")
-            return
-        }
-
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // 1. Local Regex Relationship Fact Extraction
+                // Local zero-bandwidth relationship fact extraction
                 val localFacts = RelationshipMemoryExtractor.extractRelationshipFacts(userMsg)
                 localFacts.forEach { (factText, factType) ->
                     repository.addMemory(factText, factType, if (factType == "IMPORTANT") 5 else 4)
                 }
-
-                // 2. Online Deep Fact Extraction via Gemini if Key is Present
-                val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
-                if (resolvedKey.isNotEmpty() && resolvedKey != "MY_GEMINI_API_KEY") {
-                    val memoryPrompt = "Analyze this conversation turn for durable user memory. Extract every useful personal detail, preference, routine, goal, relationship detail, favorite item, explicit remember-this request, or stable fact. Return one concise memory per line, each beginning with 'User:'. Do not invent anything. If nothing durable is present, return NONE.\n\nUser: $userMsg\nAssistant: $assistantMsg\n\nMemories:"
-
-                    val request = GeminiRequest(
-                        contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = memoryPrompt))))
-                    )
-
-                    val response = ApiClients.geminiService.generateContent(
-                        model = "gemini-3.5-flash-lite",
-                        apiKey = resolvedKey,
-                        request = request
-                    )
-
-                    val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text?.trim()
-                    if (!text.isNullOrEmpty() && !text.equals("NONE", ignoreCase = true)) {
-                        text.lines()
-                            .map { it.trim().removePrefix("-").trim() }
-                            .filter { it.isNotBlank() && !it.equals("NONE", ignoreCase = true) }
-                            .take(12)
-                            .forEach { line ->
-                                repository.addMemory(line.removePrefix("User:").trim(), "FACT", 4)
-                            }
-                    }
-                }
             } catch (e: Exception) {
-                Log.e("BabyViewModel", "Failed to auto extract memory: ${e.message}")
+                Log.e("BabyViewModel", "Failed to extract local relationship memory: ${e.message}")
             }
         }
     }
@@ -1379,15 +1350,17 @@ suspend fun callOnlineAIWrapper(
 
     repository?.addLog("AI_Call", "Calling Gemini API in background service...")
 
-    val systemInstructionText = "You are Baby, a natural, emotionally intelligent AI assistant for Android. Keep your answers concise, engaging, and friendly."
+    val systemInstructionText = "You are Baby, a helpful, emotionally intelligent personal AI companion for Android. Keep voice responses conversational, natural, and concise."
     val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
 
     val contents = mutableListOf<GeminiContent>()
-    history.takeLast(5).forEach { turn ->
+    history.takeLast(4).forEach { turn ->
+        val textContent = turn["content"] ?: ""
+        val trimmed = if (textContent.length > 250) textContent.take(250) + "..." else textContent
         contents.add(
             GeminiContent(
                 role = if (turn["role"] == "user") "user" else "model",
-                parts = listOf(GeminiPart(text = turn["content"] ?: ""))
+                parts = listOf(GeminiPart(text = trimmed))
             )
         )
     }
@@ -1405,23 +1378,40 @@ suspend fun callOnlineAIWrapper(
 
     val modelToUse = repository?.getSetting("gemini_model", "gemini-3.6-flash") ?: "gemini-3.6-flash"
 
-    val apiResponse = callGeminiWithExponentialBackoff(
-        model = modelToUse,
-        apiKey = resolvedKey,
-        request = request
-    )
+    try {
+        val apiResponse = callGeminiWithExponentialBackoff(
+            model = modelToUse,
+            apiKey = resolvedKey,
+            request = request
+        )
 
-    apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-        ?: throw Exception("Empty response from Gemini API.")
+        apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+            ?: "I heard you, but I didn't receive a response. Please try again."
+    } catch (e: retrofit2.HttpException) {
+        when (e.code()) {
+            401, 403 -> "Your API key is invalid. Please check Settings."
+            429 -> "The AI server is busy right now. Please try again shortly."
+            in 500..599 -> "The AI service is temporarily unavailable."
+            else -> "I couldn't complete that request."
+        }
+    } catch (e: java.net.SocketTimeoutException) {
+        "The connection timed out due to slow network. Please try again."
+    } catch (e: java.net.UnknownHostException) {
+        "You're currently offline. Please check your connection."
+    } catch (e: java.io.IOException) {
+        "Network connection was interrupted. Please try again."
+    } catch (e: Exception) {
+        "I couldn't reach the server right now. Please check your connection."
+    }
 }
 
 suspend fun callGeminiWithExponentialBackoff(
     model: String,
     apiKey: String,
     request: GeminiRequest,
-    maxRetries: Int = 2
+    maxRetries: Int = 3
 ): GeminiResponse = withContext(Dispatchers.IO) {
-    var delayMs = 350L
+    var delayMs = 1000L
     for (attempt in 0 until maxRetries) {
         try {
             return@withContext ApiClients.geminiService.generateContent(
@@ -1430,22 +1420,34 @@ suspend fun callGeminiWithExponentialBackoff(
                 request = request
             )
         } catch (e: retrofit2.HttpException) {
-            if ((e.code() == 429 || e.code() >= 500) && attempt < maxRetries - 1) {
-                Log.w("GeminiAPI", "HTTP ${e.code()} error. Retrying attempt ${attempt + 1} in ${delayMs}ms...")
-                delay(delayMs)
-                delayMs *= 2
+            val isRetryable = e.code() == 429 || e.code() in 500..599
+            if (isRetryable && attempt < maxRetries - 1) {
+                val jitter = (50..250).random()
+                Log.w("GeminiAPI", "HTTP ${e.code()} error. Retrying attempt ${attempt + 1} in ${delayMs + jitter}ms...")
+                delay(delayMs + jitter)
+                delayMs = (delayMs * 2).coerceAtMost(6000L)
+            } else {
+                throw e
+            }
+        } catch (e: java.io.IOException) {
+            // SocketTimeoutException, UnknownHostException, ConnectException, SSLException
+            if (attempt < maxRetries - 1) {
+                val jitter = (50..250).random()
+                Log.w("GeminiAPI", "Network exception ${e.javaClass.simpleName}: ${e.message}. Retrying attempt ${attempt + 1} in ${delayMs + jitter}ms...")
+                delay(delayMs + jitter)
+                delayMs = (delayMs * 2).coerceAtMost(6000L)
             } else {
                 throw e
             }
         } catch (e: Exception) {
             if (attempt < maxRetries - 1) {
-                Log.w("GeminiAPI", "Network exception ${e.message}. Retrying attempt ${attempt + 1} in ${delayMs}ms...")
+                Log.w("GeminiAPI", "Unexpected exception ${e.message}. Retrying attempt ${attempt + 1}...")
                 delay(delayMs)
-                delayMs *= 2
+                delayMs = (delayMs * 2).coerceAtMost(6000L)
             } else {
                 throw e
             }
         }
     }
-    throw Exception("Gemini API call failed after $maxRetries attempts.")
+    throw Exception("Network request failed after $maxRetries attempts.")
 }
