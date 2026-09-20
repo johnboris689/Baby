@@ -81,6 +81,9 @@ dependencies {
     // JSON
     implementation("org.json:json:20240303")
 
+    // Testing
+    testImplementation(libs.junit)
+
     // Debugging
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

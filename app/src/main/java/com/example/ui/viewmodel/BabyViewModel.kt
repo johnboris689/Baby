@@ -8,15 +8,6 @@ import com.example.ui.voice.BabyAssistantService
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.baby.ai.BuildConfig
-import com.example.data.api.ApiClients
-import com.example.data.api.GeminiContent
-import com.example.data.api.GeminiPart
-import com.example.data.api.GeminiInlineData
-import com.example.data.api.GeminiFileData
-import com.example.data.api.GeminiFileUploader
-import com.example.data.api.GeminiRequest
-import com.example.data.api.GeminiResponse
-import com.example.data.api.GeminiGenerationConfig
 import com.example.data.model.Attachment
 import com.example.data.local.entity.ConversationEntity
 import com.example.data.local.entity.LogEntity
@@ -43,6 +34,15 @@ import com.example.ui.theme.BabyCyan
 import com.example.ui.theme.BabyGreen
 import com.example.ui.theme.BabyViolet
 import kotlinx.coroutines.Dispatchers
+import com.example.ai.BabyAIOrchestrator
+import com.example.ai.BabyLocalAIEngine
+import com.example.ai.BabyModelManager
+import com.example.ai.HardwareDetector
+import com.example.ai.HardwareProfile
+import com.example.ai.ModelCatalog
+import com.example.ai.ModelDescriptor
+import com.example.ai.ModelInstallationState
+import com.example.ai.ModelStatus
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -59,10 +59,11 @@ enum class AssistantState {
 }
 
 enum class BabyConnectionState {
-    ONLINE,               // Internet connected AND API key is configured
-    OFFLINE_NO_KEY,       // Missing/unconfigured Gemini API Key
-    OFFLINE_NO_INTERNET,  // API Key exists, but no active network
-    OFFLINE_UNCONFIGURED  // No internet and no API key
+    ONLINE,               // Internet connected (for optional network tools)
+    OFFLINE_LOCAL_READY,  // On-device AI engine ready & running locally
+    OFFLINE_NO_KEY,       // Legacy compatibility
+    OFFLINE_NO_INTERNET,  // Offline with on-device AI active
+    OFFLINE_UNCONFIGURED  // Initializing
 }
 
 data class BabyStatus(
@@ -141,46 +142,43 @@ class BabyViewModel(
     val logs: StateFlow<List<LogEntity>> = repository.allLogs
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // --- Configuration State ---
+    // --- Configuration & Local AI Engine ---
     private val deviceControlManager = DeviceControlManager(application)
     private val routingEngine = CommandRoutingEngine(deviceControlManager)
     private val networkMonitor = NetworkMonitor(application)
     private val _isInternetAvailable = MutableStateFlow(true)
     val isInternetAvailable: StateFlow<Boolean> = _isInternetAvailable.asStateFlow()
 
+    val modelManager = BabyModelManager(application, viewModelScope)
+    val localEngine = BabyLocalAIEngine(application, modelManager)
+    val orchestrator = BabyAIOrchestrator(application, modelManager, localEngine, repository, routingEngine)
+    val hardwareProfile: HardwareProfile = HardwareDetector.detect(application)
+    val modelStatus: StateFlow<ModelStatus> = modelManager.modelStatus
+
     private val _apiKey = MutableStateFlow("")
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
-
-    val isApiKeyConfigured: StateFlow<Boolean> = _apiKey
-        .map { key ->
-            val resolved = key.ifEmpty { BuildConfig.GEMINI_API_KEY }.trim()
-            resolved.isNotEmpty() && resolved != "MY_GEMINI_API_KEY" && !resolved.startsWith("YOUR_")
-        }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+    val isApiKeyConfigured: StateFlow<Boolean> = MutableStateFlow(true).asStateFlow()
 
     val babyStatus: StateFlow<BabyStatus> = combine(
         _isInternetAvailable,
-        isApiKeyConfigured,
+        modelManager.modelStatus,
         _assistantState
-    ) { internet, hasKey, state ->
-        val isOnline = internet && hasKey
+    ) { internet, modelStat, state ->
         val connectionState = when {
-            internet && hasKey -> BabyConnectionState.ONLINE
-            !hasKey && internet -> BabyConnectionState.OFFLINE_NO_KEY
-            hasKey && !internet -> BabyConnectionState.OFFLINE_NO_INTERNET
-            else -> BabyConnectionState.OFFLINE_UNCONFIGURED
+            internet -> BabyConnectionState.ONLINE
+            modelStat.isReady -> BabyConnectionState.OFFLINE_LOCAL_READY
+            else -> BabyConnectionState.OFFLINE_NO_INTERNET
         }
 
-        val defaultText = when (connectionState) {
-            BabyConnectionState.ONLINE -> "Online • Ready"
-            BabyConnectionState.OFFLINE_NO_KEY -> "Offline • Key Required"
-            BabyConnectionState.OFFLINE_NO_INTERNET -> "Offline • No Network"
-            BabyConnectionState.OFFLINE_UNCONFIGURED -> "Offline • Unconfigured"
+        val defaultText = when {
+            modelStat.state == ModelInstallationState.DOWNLOADING -> "Installing Model (${(modelStat.downloadProgress * 100).toInt()}%)"
+            modelStat.isReady -> if (internet) "Local AI • Online" else "Local AI • Offline Ready"
+            else -> if (internet) "Local AI • Online" else "Local AI • Offline Ready"
         }
 
         val statusText = when (state) {
             AssistantState.LISTENING -> "Listening..."
-            AssistantState.THINKING -> "Thinking..."
+            AssistantState.THINKING -> "Thinking (Local AI)..."
             AssistantState.SPEAKING -> "Speaking..."
             AssistantState.IDLE -> defaultText
         }
@@ -189,29 +187,28 @@ class BabyViewModel(
             state == AssistantState.LISTENING -> BabyCyan
             state == AssistantState.THINKING -> BabyViolet
             state == AssistantState.SPEAKING -> BabyBlue
-            isOnline -> BabyGreen
-            else -> Color(0xFFF59E0B)
+            else -> BabyGreen
         }
 
         BabyStatus(
             connectionState = connectionState,
             assistantState = state,
-            isOnline = isOnline,
+            isOnline = internet,
             statusText = statusText,
             indicatorColor = indicatorColor,
-            isKeyConfigured = hasKey,
+            isKeyConfigured = true,
             isInternetAvailable = internet
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
         BabyStatus(
-            connectionState = BabyConnectionState.OFFLINE_UNCONFIGURED,
+            connectionState = BabyConnectionState.OFFLINE_LOCAL_READY,
             assistantState = AssistantState.IDLE,
             isOnline = false,
-            statusText = "Offline",
-            indicatorColor = Color(0xFFF59E0B),
-            isKeyConfigured = false,
+            statusText = "Local AI • Offline Ready",
+            indicatorColor = BabyGreen,
+            isKeyConfigured = true,
             isInternetAvailable = false
         )
     )
@@ -669,14 +666,19 @@ class BabyViewModel(
             _translationResult.value = ""
             return
         }
+        val safetyEval = com.example.safety.JBRestrictions.evaluate(text)
+        if (!safetyEval.isAllowed) {
+            _translationResult.value = safetyEval.userFacingResponse ?: "I cannot complete that request."
+            return
+        }
         viewModelScope.launch {
             _isTranslating.value = true
             try {
                 val prompt = "Translate the following text from $sourceLang to $targetLang accurately, naturally preserving context and tone. Output ONLY the translation directly without any explanation, quotes or preamble:\n\n$text"
-                val res = callOnlineAI(prompt, emptyList(), emptyList())
+                val res = orchestrator.generateResponse(prompt)
                 _translationResult.value = res.trim()
             } catch (e: Exception) {
-                _translationResult.value = "Translation error: ${e.message ?: "Network timeout"}"
+                _translationResult.value = "Translation error: ${e.message ?: "Processing error"}"
             } finally {
                 _isTranslating.value = false
             }
@@ -764,44 +766,48 @@ class BabyViewModel(
                     }
                 }
 
-                val activeMsgHistory = activeMessages.value.map {
-                    mapOf("role" to it.role, "content" to it.content)
+                // Centralized AI Safety and Usage Guardrails: JB Restrictions
+                val attachmentsText = attachments.mapNotNull { it.extractedText }.joinToString("\n")
+                val safetyEval = com.example.safety.JBRestrictions.evaluate(finalPrompt, attachmentsText)
+                if (!safetyEval.isAllowed) {
+                    repository.addLog("Safety_Policy", "JB Restrictions: Request redirected/refused (${safetyEval.category?.title ?: "Policy"}).")
+                    val refusal = safetyEval.userFacingResponse ?: "I can't assist with that request."
+                    simulateStreamingText(refusal, convId)
+                    return@launch
                 }
 
-                val responseText = callOnlineAI(finalPrompt, activeMsgHistory, attachments)
+                _streamingMessageText.value = ""
+                _assistantState.value = AssistantState.SPEAKING
+                val responseAccumulator = StringBuilder()
 
-                // Render the response immediately; do not add artificial typing latency.
-                simulateStreamingText(responseText, convId)
+                orchestrator.streamResponse(finalPrompt, convId, attachments).collect { token ->
+                    responseAccumulator.append(token)
+                    _streamingMessageText.value = responseAccumulator.toString()
+                }
+
+                val finalOutput = responseAccumulator.toString()
+                if (finalOutput.isNotEmpty()) {
+                    repository.addMessage(convId, "assistant", finalOutput)
+                    speak(finalOutput)
+                    extractMemoryInBackground(finalOutput.take(4000), finalOutput)
+                }
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 repository.addLog("AI", "Generation job cancelled/interrupted.")
-                throw e
-            } catch (e: retrofit2.HttpException) {
-                val errorMsg = when (e.code()) {
-                    401, 403 -> "Your Gemini API key appears invalid or expired. Please update it in Settings."
-                    429 -> "The AI service is temporarily busy. Please wait a moment and try again."
-                    in 500..599 -> "The AI service is temporarily unavailable. Please retry shortly."
-                    else -> "Unable to get an AI response (HTTP ${e.code()}). Please retry."
+                val partialText = _streamingMessageText.value ?: ""
+                if (partialText.isNotEmpty()) {
+                    repository.addMessage(convId, "assistant", "$partialText... [Interrupted]")
+                    speak(partialText)
                 }
-                repository.addLog("AI_Error", "HTTP ${e.code()} from Gemini API: ${e.message}")
-                simulateStreamingText(errorMsg, convId)
-            } catch (e: java.net.SocketTimeoutException) {
-                repository.addLog("AI_Error", "Network timeout on weak connection: ${e.message}")
-                val timeoutMsg = "Your network connection is very slow and timed out. Give it a moment and try again."
-                simulateStreamingText(timeoutMsg, convId)
-            } catch (e: java.net.UnknownHostException) {
-                repository.addLog("AI_Error", "DNS/host resolution failed: ${e.message}")
-                val offlineMsg = "You're currently offline. Please check your network connection and retry."
-                simulateStreamingText(offlineMsg, convId)
-            } catch (e: java.io.IOException) {
-                repository.addLog("AI_Error", "Network I/O failure: ${e.message}")
-                val netMsg = "Connection was interrupted due to weak network. Please tap below to retry."
-                simulateStreamingText(netMsg, convId)
+                throw e
             } catch (e: Exception) {
-                repository.addLog("AI_Error", "Failed to generate AI response: ${e.message}")
-                val genericMsg = "I couldn't complete the request right now. Please check your connection and retry."
-                simulateStreamingText(genericMsg, convId)
+                repository.addLog("AI_Error", "Local inference exception: ${e.message}")
+                val errorMsg = "I encountered an issue processing locally: ${e.localizedMessage ?: "Please retry"}"
+                simulateStreamingText(errorMsg, convId)
             } finally {
+                _streamingMessageText.value = null
+                _assistantState.value = AssistantState.IDLE
+                activeGenerationJob = null
                 // ZIP media is materialized only for the current request; remove it after the request finishes.
                 attachments.flatMap { it.extractedMedia }.forEach { media ->
                     runCatching { media.file.delete() }
@@ -849,134 +855,34 @@ class BabyViewModel(
         }
     }
 
+    // --- Model Management & Control ---
+    fun downloadModel(onComplete: ((Boolean) -> Unit)? = null) {
+        modelManager.startDownload(onComplete)
+    }
+
+    fun cancelModelDownload() {
+        modelManager.cancelDownload()
+    }
+
+    fun deleteModel(): Boolean {
+        return modelManager.deleteInstalledModel()
+    }
+
+    fun selectModel(model: ModelDescriptor) {
+        modelManager.selectModel(model)
+        localEngine.tryLoadInstalledModel()
+    }
+
+    fun reloadLocalModel() {
+        localEngine.tryLoadInstalledModel()
+    }
+
     private suspend fun callOnlineAI(
         prompt: String,
         history: List<Map<String, String>>,
         attachments: List<Attachment> = emptyList()
-    ): String = withContext(Dispatchers.IO) {
-        val detectedEmotion = EmotionDetector.detectEmotion(prompt)
-        val resolvedKey = _apiKey.value.ifEmpty { BuildConfig.GEMINI_API_KEY }
-
-        if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
-            return@withContext "Please enter your Gemini API Key in Settings to enable AI responses."
-        }
-
-        repository.addLog("AI_Call", "Calling Gemini API with ${attachments.size} attachments...")
-
-        // Lightweight memory selection: retrieve top 4 distinct memories to keep payload small
-        val maxMemories = if (_isPowerSaveActive.value) 2 else 4
-        val keywordMemories = repository.searchMemories(prompt, maxMemories)
-        val importantMemories = repository.getRecentImportantMemories(maxMemories)
-        val selectedMemories = (keywordMemories + importantMemories)
-            .distinctBy { it.content }
-            .sortedWith(compareByDescending<MemoryEntity> { it.importance }.thenByDescending { it.timestamp })
-            .take(4)
-
-        val memoryList = selectedMemories
-        val currentMood = MoodRadar.detect(prompt, _rmsDb.value)
-        _moodSignal.value = currentMood
-
-        val isPowerSave = _isPowerSaveActive.value
-        val isDeepThinking = _thinkingMode.value == "deep"
-
-        val systemInstructionText = CompanionPersonality.buildSystemPrompt(
-            memories = memoryList,
-            detectedEmotion = detectedEmotion,
-            isPowerSave = isPowerSave,
-            isDeepThinking = isDeepThinking,
-            moodSignal = currentMood
-        )
-
-        val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
-
-        val contents = mutableListOf<GeminiContent>()
-
-        // Append historical turns (last 4 turns) with trimmed length on older messages to minimize bandwidth
-        val maxHistory = if (_isPowerSaveActive.value) 2 else 4
-        history.takeLast(maxHistory).forEach { turn ->
-            val textContent = turn["content"] ?: ""
-            val trimmed = if (textContent.length > 300) textContent.take(300) + "..." else textContent
-            contents.add(
-                GeminiContent(
-                    role = if (turn["role"] == "user") "user" else "model",
-                    parts = listOf(GeminiPart(text = trimmed))
-                )
-            )
-        }
-
-        // Build current turn parts
-        val partsList = mutableListOf<GeminiPart>()
-
-        // Small media is sent inline. Large media is uploaded through Gemini Files API.
-        // Text, DOCX and ZIP files are expanded locally so Baby can read their contents.
-        var docContext = ""
-        attachments.forEach { att ->
-            if (!att.base64Data.isNullOrEmpty()) {
-                partsList.add(GeminiPart(inlineData = GeminiInlineData(mimeType = att.mimeType, data = att.base64Data)))
-            } else if (att.isGeminiMedia) {
-                try {
-                    val uploaded = GeminiFileUploader.upload(
-                        context = getApplication<Application>(),
-                        uri = att.uri,
-                        apiKey = resolvedKey,
-                        mimeType = att.mimeType,
-                        displayName = att.name
-                    )
-                    partsList.add(GeminiPart(fileData = GeminiFileData(mimeType = uploaded.mimeType, fileUri = uploaded.uri)))
-                } catch (e: Exception) {
-                    docContext += "\n[Attached media: ${att.name}]\nUpload failed: ${e.message ?: "unknown error"}.\n"
-                }
-            }
-
-            if (!att.extractedText.isNullOrBlank()) {
-                docContext += "\n[Attached file: ${att.name}]\n${att.extractedText}\n"
-            }
-
-            // ZIPs can contain their own images, videos, PDFs, spreadsheets and presentations.
-            att.extractedMedia.forEach { media ->
-                try {
-                    val uploaded = GeminiFileUploader.uploadFile(
-                        file = media.file,
-                        apiKey = resolvedKey,
-                        mimeType = media.mimeType,
-                        displayName = "${att.name} / ${media.name}"
-                    )
-                    partsList.add(GeminiPart(fileData = GeminiFileData(mimeType = uploaded.mimeType, fileUri = uploaded.uri)))
-                } catch (e: Exception) {
-                    docContext += "\n[ZIP binary entry: ${media.name}]\nUpload failed: ${e.message ?: "unknown error"}.\n"
-                }
-            }
-        }
-
-        var finalPromptText = prompt
-        if (docContext.isNotEmpty()) {
-            finalPromptText += "\n\nAttached File Contents:\n$docContext"
-        }
-
-        partsList.add(GeminiPart(text = finalPromptText))
-
-        contents.add(GeminiContent(role = "user", parts = partsList))
-
-        val generationConfig = if (_isPowerSaveActive.value) {
-            GeminiGenerationConfig(maxOutputTokens = 150)
-        } else null
-
-        val request = GeminiRequest(
-            contents = contents,
-            systemInstruction = systemInstruction,
-            generationConfig = generationConfig
-        )
-
-        val modelToUse = _geminiModel.value.ifEmpty { "gemini-3.6-flash" }
-
-        val apiResponse = callGeminiWithExponentialBackoff(
-            model = modelToUse,
-            apiKey = resolvedKey,
-            request = request
-        )
-
-        apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-            ?: throw Exception("Empty response from Gemini API.")
+    ): String = withContext(Dispatchers.Default) {
+        orchestrator.generateResponse(prompt, _activeConversationId.value ?: 1L, attachments)
     }
 
     // --- Vector & Semantic Database Helpers ---
@@ -1342,112 +1248,20 @@ suspend fun callOnlineAIWrapper(
     history: List<Map<String, String>>,
     apiKey: String,
     repository: BabyRepository?
-): String = withContext(Dispatchers.IO) {
-    val resolvedKey = apiKey.ifEmpty { BuildConfig.GEMINI_API_KEY }
-    if (resolvedKey.isEmpty() || resolvedKey == "MY_GEMINI_API_KEY") {
-        return@withContext "Please enter your Gemini API Key in Settings to enable AI responses."
+): String = withContext(Dispatchers.Default) {
+    val safetyEval = com.example.safety.JBRestrictions.evaluate(prompt)
+    if (!safetyEval.isAllowed) {
+        repository?.addLog("Safety_Policy", "JB Restrictions: Background voice prompt intercepted (${safetyEval.category?.title}).")
+        return@withContext safetyEval.userFacingResponse ?: "I can't assist with that request."
     }
 
-    repository?.addLog("AI_Call", "Calling Gemini API in background service...")
+    repository?.addLog("AI_Local", "Executing on-device local cognitive engine for voice command...")
 
-    val systemInstructionText = "You are Baby, a helpful, emotionally intelligent personal AI companion for Android. Keep voice responses conversational, natural, and concise."
-    val systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText)))
-
-    val contents = mutableListOf<GeminiContent>()
-    history.takeLast(4).forEach { turn ->
-        val textContent = turn["content"] ?: ""
-        val trimmed = if (textContent.length > 250) textContent.take(250) + "..." else textContent
-        contents.add(
-            GeminiContent(
-                role = if (turn["role"] == "user") "user" else "model",
-                parts = listOf(GeminiPart(text = trimmed))
-            )
-        )
-    }
-
-    if (contents.isNotEmpty() && contents.last().role == "user") {
-        contents[contents.lastIndex] = GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt)))
+    val localResponse = com.example.ai.EmbeddedLocalBrain.processQuery(prompt)
+    val outputSafety = com.example.safety.JBRestrictions.evaluateOutput(localResponse)
+    if (!outputSafety.isAllowed) {
+        outputSafety.userFacingResponse ?: "I cannot provide that specific response under safety policy."
     } else {
-        contents.add(GeminiContent(role = "user", parts = listOf(GeminiPart(text = prompt))))
+        localResponse
     }
-
-    val request = GeminiRequest(
-        contents = contents,
-        systemInstruction = systemInstruction
-    )
-
-    val modelToUse = repository?.getSetting("gemini_model", "gemini-3.6-flash") ?: "gemini-3.6-flash"
-
-    try {
-        val apiResponse = callGeminiWithExponentialBackoff(
-            model = modelToUse,
-            apiKey = resolvedKey,
-            request = request
-        )
-
-        apiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-            ?: "I heard you, but I didn't receive a response. Please try again."
-    } catch (e: retrofit2.HttpException) {
-        when (e.code()) {
-            401, 403 -> "Your API key is invalid. Please check Settings."
-            429 -> "The AI server is busy right now. Please try again shortly."
-            in 500..599 -> "The AI service is temporarily unavailable."
-            else -> "I couldn't complete that request."
-        }
-    } catch (e: java.net.SocketTimeoutException) {
-        "The connection timed out due to slow network. Please try again."
-    } catch (e: java.net.UnknownHostException) {
-        "You're currently offline. Please check your connection."
-    } catch (e: java.io.IOException) {
-        "Network connection was interrupted. Please try again."
-    } catch (e: Exception) {
-        "I couldn't reach the server right now. Please check your connection."
-    }
-}
-
-suspend fun callGeminiWithExponentialBackoff(
-    model: String,
-    apiKey: String,
-    request: GeminiRequest,
-    maxRetries: Int = 3
-): GeminiResponse = withContext(Dispatchers.IO) {
-    var delayMs = 1000L
-    for (attempt in 0 until maxRetries) {
-        try {
-            return@withContext ApiClients.geminiService.generateContent(
-                model = model,
-                apiKey = apiKey,
-                request = request
-            )
-        } catch (e: retrofit2.HttpException) {
-            val isRetryable = e.code() == 429 || e.code() in 500..599
-            if (isRetryable && attempt < maxRetries - 1) {
-                val jitter = (50..250).random()
-                Log.w("GeminiAPI", "HTTP ${e.code()} error. Retrying attempt ${attempt + 1} in ${delayMs + jitter}ms...")
-                delay(delayMs + jitter)
-                delayMs = (delayMs * 2).coerceAtMost(6000L)
-            } else {
-                throw e
-            }
-        } catch (e: java.io.IOException) {
-            // SocketTimeoutException, UnknownHostException, ConnectException, SSLException
-            if (attempt < maxRetries - 1) {
-                val jitter = (50..250).random()
-                Log.w("GeminiAPI", "Network exception ${e.javaClass.simpleName}: ${e.message}. Retrying attempt ${attempt + 1} in ${delayMs + jitter}ms...")
-                delay(delayMs + jitter)
-                delayMs = (delayMs * 2).coerceAtMost(6000L)
-            } else {
-                throw e
-            }
-        } catch (e: Exception) {
-            if (attempt < maxRetries - 1) {
-                Log.w("GeminiAPI", "Unexpected exception ${e.message}. Retrying attempt ${attempt + 1}...")
-                delay(delayMs)
-                delayMs = (delayMs * 2).coerceAtMost(6000L)
-            } else {
-                throw e
-            }
-        }
-    }
-    throw Exception("Network request failed after $maxRetries attempts.")
 }

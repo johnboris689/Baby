@@ -38,6 +38,9 @@ import com.example.data.local.RoutingResult
 import com.example.data.local.db.AppDatabase
 import com.example.data.repository.BabyRepository
 import com.example.ui.viewmodel.callOnlineAIWrapper
+import com.example.ai.BabyAIOrchestrator
+import com.example.ai.BabyLocalAIEngine
+import com.example.ai.BabyModelManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -58,6 +61,7 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
+    private var orchestrator: BabyAIOrchestrator? = null
     private var isTtsInitialized = false
     private var isSpeaking = false
     private var isListening = false
@@ -161,6 +165,10 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             db.taskDao(),
             db.automationRuleDao()
         )
+
+        val modelManager = BabyModelManager(applicationContext)
+        val localEngine = BabyLocalAIEngine(applicationContext, modelManager)
+        orchestrator = BabyAIOrchestrator(applicationContext, modelManager, localEngine, repository!!, routingEngine!!)
 
         createNotificationChannel()
         val notification = createNotification("BabyAI Background Assistant active")
@@ -812,6 +820,24 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
         // Save command into database
         repository?.addMessage(activeConvId, "user", commandText)
 
+        // Centralized AI Safety and Usage Guardrails: JB Restrictions
+        val safetyEval = com.example.safety.JBRestrictions.evaluate(commandText)
+        if (!safetyEval.isAllowed) {
+            repository?.addLog("Safety_Policy", "JB Restrictions: Background voice command refused (${safetyEval.category?.title}).")
+            val refusal = safetyEval.userFacingResponse ?: "I cannot assist with that request."
+            repository?.addMessage(activeConvId, "assistant", refusal)
+            speak(refusal)
+            isProcessingCommand = false
+            if (isContinuousConversation) {
+                delay(600)
+                startCommandListening()
+            } else if (wakeWordEnabled) {
+                delay(500)
+                startPassiveWakeWordListening()
+            }
+            return
+        }
+
         // 1. Route intent using CommandRoutingEngine
         val routeResult = routingEngine?.routeAndExecute(commandText) ?: RoutingResult.SendToGemini
 
@@ -831,20 +857,11 @@ class BabyAssistantService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        // 2. Otherwise fall back to Gemini AI response
-        updateNotificationText("BabyAI: Thinking...")
+        // 2. Otherwise process via on-device Baby AI Orchestrator
+        updateNotificationText("BabyAI: Thinking (Local AI)...")
         try {
-            val apiKey = repository?.getSetting("api_key", "") ?: ""
-            val lastMessages = repository?.getMessages(activeConvId)?.firstOrNull()?.takeLast(6) ?: emptyList()
-            val messagesHistory = if (lastMessages.isNotEmpty()) {
-                lastMessages.map {
-                    mapOf("role" to it.role, "content" to it.content)
-                }
-            } else {
-                listOf(mapOf("role" to "user", "content" to commandText))
-            }
-
-            val aiResponse = callOnlineAIWrapper(commandText, messagesHistory, apiKey, repository)
+            val aiResponse = orchestrator?.generateResponse(commandText, activeConvId)
+                ?: callOnlineAIWrapper(commandText, emptyList(), "", repository)
 
             repository?.addMessage(activeConvId, "assistant", aiResponse)
             speak(aiResponse)

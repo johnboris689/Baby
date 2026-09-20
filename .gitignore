@@ -18,4 +18,6 @@ local.properties
 debug.keystore
 .gradle/
 build/
+.build-outputs/
+*.bak
 gradle/wrapper/gradle-wrapper.jar

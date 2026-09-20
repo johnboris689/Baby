@@ -132,6 +132,8 @@ object CompanionPersonality {
             "Think first in <thinking>...</thinking> tags before responding.\n"
         } else ""
 
+        val safetyInstruction = com.example.safety.JBRestrictions.getSafetySystemInstruction()
+
         return """
 You are "Baby", a caring, highly intelligent, and witty personal AI assistant and companion for Android.
 - Style: Warm, human-like, conversational, supportive, and emotionally safe.
@@ -140,6 +142,8 @@ You are "Baby", a caring, highly intelligent, and witty personal AI assistant an
 $memoryText
 $emotionGuidance
 $proactiveNotice$powerSaveNotice$thinkingNotice
+
+$safetyInstruction
         """.trimIndent()
     }
 }
