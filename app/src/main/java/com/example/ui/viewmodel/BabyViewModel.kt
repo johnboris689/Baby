@@ -43,6 +43,8 @@ import com.example.ai.ModelCatalog
 import com.example.ai.ModelDescriptor
 import com.example.ai.ModelInstallationState
 import com.example.ai.ModelStatus
+import com.example.ai.LocalModelLoadResult
+import com.example.ai.GgufMetadata
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -856,8 +858,16 @@ class BabyViewModel(
     }
 
     // --- Model Management & Control ---
+    val selfTestResult = androidx.compose.runtime.mutableStateOf<String?>(null)
+
     fun downloadModel(onComplete: ((Boolean) -> Unit)? = null) {
-        modelManager.startDownload(onComplete)
+        selfTestResult.value = null
+        modelManager.startDownload { success ->
+            if (success) {
+                reloadLocalModel()
+            }
+            onComplete?.invoke(success)
+        }
     }
 
     fun cancelModelDownload() {
@@ -865,16 +875,32 @@ class BabyViewModel(
     }
 
     fun deleteModel(): Boolean {
-        return modelManager.deleteInstalledModel()
+        selfTestResult.value = null
+        val deleted = modelManager.deleteInstalledModel()
+        localEngine.tryLoadInstalledModel()
+        return deleted
     }
 
     fun selectModel(model: ModelDescriptor) {
+        selfTestResult.value = null
         modelManager.selectModel(model)
         localEngine.tryLoadInstalledModel()
     }
 
     fun reloadLocalModel() {
-        localEngine.tryLoadInstalledModel()
+        val res = localEngine.tryLoadInstalledModel()
+        if (res is LocalModelLoadResult.Success) {
+            selfTestResult.value = "Model Verified (${res.metadata.architecture}, ${res.metadata.tensorCount} tensors, ctx: ${res.metadata.contextLength}). Self-test response:\n\"${res.selfTestResponse}\""
+        }
+    }
+
+    fun runModelSelfTest() {
+        val res = localEngine.tryLoadInstalledModel()
+        selfTestResult.value = when (res) {
+            is LocalModelLoadResult.Success -> "Self-Test PASSED (${res.metadata.architecture}, ${res.metadata.tensorCount} tensors, ctx: ${res.metadata.contextLength}):\n${res.selfTestResponse}"
+            is LocalModelLoadResult.NotInstalled -> "Self-Test FAILED: No model weights installed."
+            is LocalModelLoadResult.Failure -> "Self-Test FAILED: ${res.error}"
+        }
     }
 
     private suspend fun callOnlineAI(

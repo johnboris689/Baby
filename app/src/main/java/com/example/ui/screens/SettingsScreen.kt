@@ -71,7 +71,7 @@ fun SettingsScreen(
             item {
                 SettingsCard("LOCAL ON-DEVICE AI ENGINE", Icons.Filled.Memory) {
                     Text(
-                        "Baby runs her own autonomous AI engine directly on your phone hardware. Zero remote API keys or cloud subscriptions required.",
+                        "Baby runs her own autonomous AI engine directly on your phone hardware. Zero remote API keys, cloud subscriptions, or tracking.",
                         color = BabyMuted,
                         fontSize = 11.sp,
                         lineHeight = 16.sp
@@ -94,10 +94,69 @@ fun SettingsScreen(
                         }
                     }
 
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(10.dp))
 
-                    // Current Model Status
-                    SettingLine("Active Model", modelStatus.currentModel.name)
+                    // Hardware compatibility advisory
+                    val currentCompatibility = ModelCatalog.getCompatibility(modelStatus.currentModel, hardware)
+                    if (currentCompatibility == DeviceCompatibility.COMPATIBLE_HIGH_MEMORY) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color(0x22F59E0B), RoundedCornerShape(10.dp))
+                                .border(1.dp, Color(0x66F59E0B), RoundedCornerShape(10.dp))
+                                .padding(10.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Filled.Warning, null, tint = Color(0xFFF59E0B), modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Hardware Advisory: High Memory Load", color = Color(0xFFF59E0B), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "${modelStatus.currentModel.name} requires ~${modelStatus.currentModel.minRamMb} MB RAM. Your device has ${hardware.formattedRam}. Running this model may cause memory pressure. We recommend Baby Compact for smooth performance.",
+                                color = BabyText,
+                                fontSize = 10.sp,
+                                lineHeight = 14.sp
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Button(
+                                onClick = { viewModel.selectModel(ModelCatalog.QWEN_0_5B) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
+                                modifier = Modifier.fillMaxWidth().height(32.dp),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("Switch to Baby Compact (Recommended)", color = Color.Black, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    } else if (currentCompatibility == DeviceCompatibility.INSUFFICIENT_RAM) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color(0x22EF4444), RoundedCornerShape(10.dp))
+                                .border(1.dp, Color(0x66EF4444), RoundedCornerShape(10.dp))
+                                .padding(10.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Filled.Error, null, tint = Color(0xFFEF4444), modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Exceeds Device Hardware Capacity", color = Color(0xFFEF4444), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "${modelStatus.currentModel.name} requires a minimum of ${modelStatus.currentModel.minRamMb} MB RAM, which exceeds this phone's total RAM (${hardware.totalRamMb} MB).",
+                                color = BabyText,
+                                fontSize = 10.sp
+                            )
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
+
+                    // Current Model Status Header
+                    SettingLine(
+                        if (modelStatus.state == ModelInstallationState.READY) "Active Model" else "Selected Model",
+                        modelStatus.currentModel.name
+                    )
                     Text(
                         "Parameters: ${modelStatus.currentModel.parameterCount} • Size: ${modelStatus.currentModel.sizeFormatted} • Quantization: ${modelStatus.currentModel.quantization}",
                         color = BabyMuted,
@@ -108,23 +167,44 @@ fun SettingsScreen(
 
                     when (modelStatus.state) {
                         ModelInstallationState.READY -> {
-                            Row(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .background(BabyGreen.copy(alpha = 0.15f), RoundedCornerShape(10.dp))
                                     .border(1.dp, BabyGreen.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
-                                    .padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                    .padding(10.dp)
                             ) {
-                                Icon(Icons.Filled.CheckCircle, null, tint = BabyGreen, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text("Model Installed & Verified", color = BabyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                    Text("Running 100% locally with high performance", color = BabyText, fontSize = 10.sp)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Filled.CheckCircle, null, tint = BabyGreen, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Model Installed, Loaded & Verified", color = BabyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                        Text(modelStatus.verificationDetails ?: "Active 100% on-device neural inference", color = BabyText, fontSize = 10.sp)
+                                    }
                                 }
                             }
+
+                            val testOutput = viewModel.selfTestResult.value
+                            if (testOutput != null) {
+                                Spacer(Modifier.height(8.dp))
+                                GlassCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp)) {
+                                    Column(Modifier.padding(8.dp)) {
+                                        Text("Self-Test Output:", color = BabyCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        Spacer(Modifier.height(4.dp))
+                                        Text(testOutput, color = BabyText, fontSize = 10.sp, lineHeight = 14.sp)
+                                    }
+                                }
+                            }
+
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = { viewModel.runModelSelfTest() },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = BabyCyan)
+                                ) {
+                                    Text("Test Token Gen", fontSize = 11.sp)
+                                }
                                 OutlinedButton(
                                     onClick = { viewModel.reloadLocalModel() },
                                     modifier = Modifier.weight(1f),
@@ -152,6 +232,10 @@ fun SettingsScreen(
                                     Text("Downloading Neural Model...", color = BabyCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                     Text("${(modelStatus.downloadProgress * 100).toInt()}% (${modelStatus.downloadSpeed})", color = BabyText, fontSize = 11.sp)
                                 }
+                                Spacer(Modifier.height(4.dp))
+                                val dlMb = modelStatus.downloadedBytes / (1024 * 1024)
+                                val totMb = modelStatus.totalBytes / (1024 * 1024)
+                                Text("$dlMb MB / $totMb MB downloaded", color = BabyMuted, fontSize = 10.sp)
                                 Spacer(Modifier.height(6.dp))
                                 LinearProgressIndicator(
                                     progress = { modelStatus.downloadProgress },
@@ -165,27 +249,66 @@ fun SettingsScreen(
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF334155))
                                 ) {
-                                    Text("Cancel Download", color = BabyText, fontSize = 11.sp)
+                                    Text("Pause / Cancel Download", color = BabyText, fontSize = 11.sp)
                                 }
                             }
                         }
                         ModelInstallationState.VERIFYING -> {
-                            Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = BabyCyan, strokeWidth = 2.dp)
-                                Spacer(Modifier.width(8.dp))
-                                Text("Verifying GGUF header and checksum...", color = BabyCyan, fontSize = 11.sp)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(BabyCyan.copy(alpha = 0.12f), RoundedCornerShape(10.dp))
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), color = BabyCyan, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Column {
+                                    Text("Verifying GGUF Header & Executing Self-Test...", color = BabyCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    Text("Inspecting binary structure and validating tokens", color = BabyMuted, fontSize = 10.sp)
+                                }
                             }
                         }
                         ModelInstallationState.ERROR -> {
-                            Column(Modifier.padding(vertical = 4.dp)) {
-                                Text(modelStatus.errorMessage ?: "Installation error", color = Color(0xFFEF4444), fontSize = 11.sp)
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color(0x22EF4444), RoundedCornerShape(10.dp))
+                                    .border(1.dp, Color(0x66EF4444), RoundedCornerShape(10.dp))
+                                    .padding(12.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Filled.ErrorOutline, null, tint = Color(0xFFEF4444), modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Download / Installation Failure", color = Color(0xFFEF4444), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
                                 Spacer(Modifier.height(6.dp))
-                                Button(
-                                    onClick = { viewModel.downloadModel() },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    colors = ButtonDefaults.buttonColors(containerColor = BabyBlue)
-                                ) {
-                                    Text("Retry Download", color = Color.White, fontSize = 11.sp)
+                                Text(
+                                    modelStatus.errorMessage ?: "Unknown error occurred during download.",
+                                    color = BabyText,
+                                    fontSize = 11.sp,
+                                    lineHeight = 15.sp
+                                )
+                                Spacer(Modifier.height(10.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = { viewModel.downloadModel() },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.buttonColors(containerColor = BabyBlue)
+                                    ) {
+                                        Text("Retry Download", color = Color.White, fontSize = 11.sp)
+                                    }
+                                    if (modelStatus.currentModel.id != ModelCatalog.QWEN_0_5B.id) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                viewModel.selectModel(ModelCatalog.QWEN_0_5B)
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = BabyCyan)
+                                        ) {
+                                            Text("Try Baby Compact", fontSize = 11.sp)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -198,11 +321,11 @@ fun SettingsScreen(
                                         .padding(10.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Icon(Icons.Filled.OfflineBolt, null, tint = BabyCyan, modifier = Modifier.size(18.dp))
+                                    Icon(Icons.Filled.WarningAmber, null, tint = Color(0xFFF59E0B), modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(8.dp))
                                     Column {
-                                        Text("Embedded Cognitive Engine Active", color = BabyText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                                        Text("Operating locally. Install GGUF weights for enhanced reasoning.", color = BabyMuted, fontSize = 10.sp)
+                                        Text("No Local Model Installed", color = BabyText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                        Text("Install model weights below to activate on-device reasoning.", color = BabyMuted, fontSize = 10.sp)
                                     }
                                 }
                                 Spacer(Modifier.height(8.dp))
@@ -213,19 +336,20 @@ fun SettingsScreen(
                                 ) {
                                     Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
                                     Spacer(Modifier.width(6.dp))
-                                    Text("Install ${modelStatus.currentModel.name} (${modelStatus.currentModel.sizeFormatted})", fontSize = 11.sp)
+                                    Text("Download & Install ${modelStatus.currentModel.name} (${modelStatus.currentModel.sizeFormatted})", fontSize = 11.sp)
                                 }
                             }
                         }
                     }
 
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(14.dp))
 
                     // Model Selection Catalog
                     Text("Select Local Model", color = BabyText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(6.dp))
                     ModelCatalog.allModels.forEach { itemModel ->
                         val isSelected = (itemModel.id == modelStatus.currentModel.id)
+                        val compatibility = ModelCatalog.getCompatibility(itemModel, hardware)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -250,8 +374,49 @@ fun SettingsScreen(
                             )
                             Spacer(Modifier.width(6.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(itemModel.name, color = BabyText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                                Text("${itemModel.sizeFormatted} • Min RAM: ${itemModel.minRamMb}MB", color = BabyMuted, fontSize = 10.sp)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(itemModel.name, color = BabyText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                    when (compatibility) {
+                                        DeviceCompatibility.RECOMMENDED -> {
+                                            Text(
+                                                "⭐ RECOMMENDED",
+                                                color = BabyGreen,
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier
+                                                    .background(BabyGreen.copy(alpha = 0.15f), RoundedCornerShape(4.dp))
+                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        DeviceCompatibility.COMPATIBLE_HIGH_MEMORY -> {
+                                            Text(
+                                                "⚠️ HIGH RAM LOAD",
+                                                color = Color(0xFFF59E0B),
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier
+                                                    .background(Color(0x22F59E0B), RoundedCornerShape(4.dp))
+                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        DeviceCompatibility.INSUFFICIENT_RAM -> {
+                                            Text(
+                                                "⛔ 5GB+ RAM REQ",
+                                                color = Color(0xFFEF4444),
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier
+                                                    .background(Color(0x22EF4444), RoundedCornerShape(4.dp))
+                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                                Text("${itemModel.sizeFormatted} • Min RAM: ${itemModel.minRamMb} MB • ${itemModel.parameterCount}", color = BabyMuted, fontSize = 10.sp)
                             }
                         }
                     }
