@@ -151,7 +151,7 @@ class BabyViewModel(
     private val _isInternetAvailable = MutableStateFlow(true)
     val isInternetAvailable: StateFlow<Boolean> = _isInternetAvailable.asStateFlow()
 
-    val modelManager = BabyModelManager(application, viewModelScope)
+    val modelManager = BabyModelManager(application)
     val localEngine = BabyLocalAIEngine(application, modelManager)
     val orchestrator = BabyAIOrchestrator(application, modelManager, localEngine, repository, routingEngine)
     val hardwareProfile: HardwareProfile = HardwareDetector.detect(application)

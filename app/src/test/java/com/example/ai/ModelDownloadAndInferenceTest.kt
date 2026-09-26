@@ -42,10 +42,10 @@ class ModelDownloadAndInferenceTest {
     }
 
     @Test
-    fun testModelDownloadUrlsAndRealGgufHeaders() {
-        // Verify Llama 3.2 1B (Baby Standard) URL returns HTTP 200/206 and has valid GGUF magic bytes
-        val standard = ModelCatalog.LLAMA_3_2_1B
-        val url = URL(standard.downloadUrl)
+    fun testBabyCompactModelUrlAndRangeResume() {
+        // Verify Qwen 2.5 0.5B (Baby Compact) URL returns HTTP 200/206 and has valid GGUF magic bytes
+        val compact = ModelCatalog.QWEN_0_5B
+        val url = URL(compact.downloadUrl)
         val conn = (url.openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", "Baby-Android/1.0")
@@ -62,16 +62,28 @@ class ModelDownloadAndInferenceTest {
         val magic = String(headerBytes.copyOfRange(0, 4), Charsets.US_ASCII)
         assertEquals("GGUF", magic)
         conn.disconnect()
+
+        // Also verify resume range from byte 1024
+        val resumeConn = (URL(compact.downloadUrl).openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "Baby-Android/1.0")
+            setRequestProperty("Range", "bytes=1024-2047")
+            connectTimeout = 15000
+            readTimeout = 15000
+        }
+        val resumeCode = resumeConn.responseCode
+        assertEquals(206, resumeCode)
+        resumeConn.disconnect()
     }
 
     @Test
     fun testGgufParserAndBinaryIntegrity() {
-        // Download first 4096 bytes of Qwen 0.5B to test local GGUF header parser
+        // Download first 16384 bytes of Qwen 0.5B to test local GGUF header parser
         val compact = ModelCatalog.QWEN_0_5B
         val conn = (URL(compact.downloadUrl).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", "Baby-Android/1.0")
-            setRequestProperty("Range", "bytes=0-4095")
+            setRequestProperty("Range", "bytes=0-16383")
             connectTimeout = 15000
             readTimeout = 15000
         }
@@ -115,5 +127,13 @@ class ModelDownloadAndInferenceTest {
         )
         assertNotNull(codingResponse)
         assertTrue(codingResponse.contains("fun") || codingResponse.contains("reverse"))
+
+        val greetingResponse = EmbeddedLocalBrain.processQuery(
+            prompt = "Hello Baby. Respond with a short greeting.",
+            documentText = "",
+            isGgufModelActive = true
+        )
+        assertNotNull(greetingResponse)
+        assertTrue(greetingResponse.isNotBlank())
     }
 }

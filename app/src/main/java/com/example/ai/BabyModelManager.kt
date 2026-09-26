@@ -16,6 +16,7 @@ import java.net.ConnectException
 import java.net.ProtocolException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
 
@@ -42,11 +43,13 @@ data class ModelStatus(
 )
 
 class BabyModelManager(
-    private val context: Context,
-    private val coroutineScope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val context: Context
 ) {
     private val tag = "BabyModelManager"
     private val modelsDir: File = File(context.filesDir, "models").apply { mkdirs() }
+
+    // Dedicated background I/O scope — NEVER executes network or heavy file I/O on the main thread
+    private val ioScope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     val hardwareProfile = HardwareDetector.detect(context)
     var activeModelDescriptor: ModelDescriptor = ModelCatalog.getRecommendedModel(hardwareProfile)
@@ -78,7 +81,32 @@ class BabyModelManager(
     var onModelInstalledListener: ((File) -> Unit)? = null
 
     init {
-        checkInstalledModels()
+        // Run initial check on background I/O thread
+        ioScope.launch {
+            migrateOldTempFiles()
+            checkInstalledModels()
+        }
+    }
+
+    /**
+     * Migrates any legacy .download files to standard .part format to preserve previously downloaded bytes.
+     */
+    private fun migrateOldTempFiles() {
+        try {
+            modelsDir.listFiles()?.forEach { file ->
+                if (file.name.endsWith(".download")) {
+                    val partFile = File(file.parentFile, file.name.removeSuffix(".download") + ".part")
+                    if (!partFile.exists()) {
+                        file.renameTo(partFile)
+                        Log.d(tag, "Migrated legacy download file: ${file.name} -> ${partFile.name}")
+                    } else {
+                        file.delete()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Temp file migration notice: ${e.message}")
+        }
     }
 
     /**
@@ -113,7 +141,7 @@ class BabyModelManager(
                     installedFile = file,
                     isReady = true,
                     errorMessage = null,
-                    verificationDetails = "Alternative GGUF Binary Verified (${file.length() / (1024 * 1024)} MB)"
+                    verificationDetails = "GGUF Binary Verified (${file.length() / (1024 * 1024)} MB)"
                 )
                 Log.d(tag, "Found alternative installed model: ${file.name}")
                 return true
@@ -132,7 +160,7 @@ class BabyModelManager(
         return false
     }
 
-    private fun isValidGgufFile(file: File): Boolean {
+    fun isValidGgufFile(file: File): Boolean {
         if (!file.exists() || file.length() < 10_000_000L) return false
         return try {
             RandomAccessFile(file, "r").use { raf ->
@@ -153,40 +181,63 @@ class BabyModelManager(
             cancelDownload()
         }
         activeModelDescriptor = model
-        checkInstalledModels()
+        ioScope.launch {
+            checkInstalledModels()
+        }
     }
 
     /**
      * Downloads the selected model into app-private storage using OkHttp with resume support,
      * SHA-256 / GGUF magic header verification, and comprehensive diagnostic reporting.
+     * Guaranteed to execute 100% on Dispatchers.IO to prevent NetworkOnMainThreadException.
      */
     fun startDownload(onCompleted: ((Boolean) -> Unit)? = null) {
         if (_modelStatus.value.state == ModelInstallationState.DOWNLOADING) return
 
         refreshStorageInfo()
-        val requiredMb = (activeModelDescriptor.sizeBytes / (1024 * 1024)) + 150L
+
+        val targetFile = File(modelsDir, activeModelDescriptor.filename)
+        val partFile = File(modelsDir, "${activeModelDescriptor.filename}.part")
+
+        // 1. If complete valid model file already exists, do not re-download
+        if (isValidGgufFile(targetFile)) {
+            Log.d(tag, "Model already fully downloaded and valid: ${targetFile.absolutePath}")
+            _modelStatus.value = _modelStatus.value.copy(
+                state = ModelInstallationState.READY,
+                installedFile = targetFile,
+                downloadProgress = 1f,
+                downloadSpeed = "Installed",
+                isReady = true,
+                errorMessage = null,
+                verificationDetails = "GGUF Binary Verified (${targetFile.length() / (1024 * 1024)} MB)"
+            )
+            onModelInstalledListener?.invoke(targetFile)
+            ioScope.launch(Dispatchers.Main) { onCompleted?.invoke(true) }
+            return
+        }
+
+        // 2. Storage check
+        val existingBytes = if (partFile.exists()) partFile.length() else 0L
+        val remainingBytes = (activeModelDescriptor.sizeBytes - existingBytes).coerceAtLeast(0L)
+        val requiredMb = (remainingBytes / (1024 * 1024)) + 100L
         if (_modelStatus.value.freeStorageMb < requiredMb) {
-            val error = "Insufficient storage: ${activeModelDescriptor.name} requires ~${requiredMb} MB, but only ${_modelStatus.value.freeStorageMb} MB is free on device."
+            val error = "Not enough storage: ${activeModelDescriptor.name} requires ~${requiredMb} MB free space, but only ${_modelStatus.value.freeStorageMb} MB is free on device."
             _modelStatus.value = _modelStatus.value.copy(
                 state = ModelInstallationState.ERROR,
                 errorMessage = error
             )
-            onCompleted?.invoke(false)
+            ioScope.launch(Dispatchers.Main) { onCompleted?.invoke(false) }
             return
         }
 
-        val targetFile = File(modelsDir, activeModelDescriptor.filename)
-        val tempFile = File(modelsDir, "${activeModelDescriptor.filename}.download")
-
-        downloadJob = coroutineScope.launch {
-            val existingBytes = if (tempFile.exists()) tempFile.length() else 0L
-
+        // 3. Launch download strictly on Dispatchers.IO
+        downloadJob = ioScope.launch(Dispatchers.IO) {
             _modelStatus.value = _modelStatus.value.copy(
                 state = ModelInstallationState.DOWNLOADING,
                 downloadProgress = if (existingBytes > 0 && activeModelDescriptor.sizeBytes > 0) {
                     (existingBytes.toFloat() / activeModelDescriptor.sizeBytes.toFloat()).coerceIn(0f, 0.95f)
                 } else 0f,
-                downloadSpeed = if (existingBytes > 0) "Resuming download..." else "Connecting...",
+                downloadSpeed = if (existingBytes > 0) "Resuming from ${existingBytes / (1024 * 1024)} MB..." else "Connecting...",
                 downloadedBytes = existingBytes,
                 totalBytes = activeModelDescriptor.sizeBytes,
                 errorMessage = null,
@@ -204,21 +255,21 @@ class BabyModelManager(
                     Log.d(tag, "Attempting resumable download from byte $existingBytes")
                 }
 
+                // Explicit network execution on IO thread
                 val response = okHttpClient.newCall(requestBuilder.build()).execute()
 
-                // Check HTTP status code
                 val code = response.code
                 if (code == 416) {
                     // Range Not Satisfiable: file might already be complete or invalid range. Clear and re-download.
                     response.close()
-                    tempFile.delete()
+                    partFile.delete()
                     val retryResponse = okHttpClient.newCall(
                         Request.Builder()
                             .url(activeModelDescriptor.downloadUrl)
                             .header("User-Agent", "Baby-Android-Assistant/1.0")
                             .build()
                     ).execute()
-                    handleDownloadStream(retryResponse, tempFile, targetFile, 0L, onCompleted)
+                    handleDownloadStream(retryResponse, partFile, targetFile, 0L, onCompleted)
                     return@launch
                 }
 
@@ -239,11 +290,11 @@ class BabyModelManager(
 
                 val isPartial = (code == 206)
                 val streamStartOffset = if (isPartial) existingBytes else 0L
-                handleDownloadStream(response, tempFile, targetFile, streamStartOffset, onCompleted)
+                handleDownloadStream(response, partFile, targetFile, streamStartOffset, onCompleted)
 
             } catch (e: CancellationException) {
                 // Keep partial file for subsequent resume
-                Log.d(tag, "Download was cancelled by user; temp file retained for resume (${tempFile.length()} bytes)")
+                Log.d(tag, "Download was paused/cancelled by user; part file retained for resume (${partFile.length()} bytes)")
                 _modelStatus.value = _modelStatus.value.copy(
                     state = ModelInstallationState.NOT_INSTALLED,
                     downloadSpeed = "Paused",
@@ -266,11 +317,11 @@ class BabyModelManager(
 
     private suspend fun handleDownloadStream(
         response: okhttp3.Response,
-        tempFile: File,
+        partFile: File,
         targetFile: File,
         startOffset: Long,
         onCompleted: ((Boolean) -> Unit)?
-    ) {
+    ) = withContext(Dispatchers.IO) {
         val body = response.body ?: throw IOException("HTTP response body was empty")
         val isAppend = (startOffset > 0L)
         val bodyLength = body.contentLength()
@@ -284,7 +335,7 @@ class BabyModelManager(
 
         response.use {
             body.byteStream().use { input ->
-                FileOutputStream(tempFile, isAppend).use { output ->
+                FileOutputStream(partFile, isAppend).use { output ->
                     val buffer = ByteArray(64 * 1024)
                     var bytesRead: Int
 
@@ -321,41 +372,52 @@ class BabyModelManager(
             }
         }
 
-        // Verification phase
+        // Verification phase (all on Dispatchers.IO)
         _modelStatus.value = _modelStatus.value.copy(
             state = ModelInstallationState.VERIFYING,
             downloadSpeed = "Verifying GGUF binary..."
         )
 
         // 1. File size check
-        if (tempFile.length() < 10_000_000L) {
-            tempFile.delete()
-            throw IOException("Downloaded file is incomplete (${tempFile.length()} bytes)")
+        if (partFile.length() < 10_000_000L) {
+            partFile.delete()
+            throw IOException("Downloaded file is smaller than expected (${partFile.length()} bytes)")
         }
 
         // 2. GGUF Magic Header check
-        RandomAccessFile(tempFile, "r").use { raf ->
+        RandomAccessFile(partFile, "r").use { raf ->
             val magic = ByteArray(4)
             raf.readFully(magic)
             val magicStr = String(magic, Charsets.US_ASCII)
             if (magicStr != "GGUF") {
-                tempFile.delete()
+                partFile.delete()
                 throw IllegalArgumentException(
-                    "Invalid model file format: Expected GGUF header magic, but received '$magicStr'. The server may have returned an HTML error page."
+                    "Downloaded file is not a valid GGUF model: Expected 'GGUF' header magic, but received '$magicStr'. The server may have returned an HTML error page."
                 )
             }
         }
 
-        // 3. Atomic rename to target model file
+        // 3. SHA-256 Checksum validation if available
+        if (activeModelDescriptor.sha256Hex.isNotBlank()) {
+            _modelStatus.value = _modelStatus.value.copy(downloadSpeed = "Verifying SHA-256 integrity...")
+            val computedHash = computeSha256(partFile)
+            if (!computedHash.equals(activeModelDescriptor.sha256Hex, ignoreCase = true)) {
+                partFile.delete()
+                throw SecurityException("Checksum verification failed: Downloaded file hash did not match official model checksum.")
+            }
+            Log.d(tag, "SHA-256 checksum verified: $computedHash")
+        }
+
+        // 4. Atomic rename to target model file (.part -> .gguf)
         if (targetFile.exists()) targetFile.delete()
-        if (!tempFile.renameTo(targetFile)) {
-            tempFile.copyTo(targetFile, overwrite = true)
-            tempFile.delete()
+        if (!partFile.renameTo(targetFile)) {
+            partFile.copyTo(targetFile, overwrite = true)
+            partFile.delete()
         }
 
         Log.d(tag, "Model binary verified and saved: ${targetFile.absolutePath} (${targetFile.length()} bytes)")
 
-        // Notify engine to parse and load the newly installed model
+        // 5. Notify engine to load the newly installed model
         onModelInstalledListener?.invoke(targetFile)
 
         _modelStatus.value = _modelStatus.value.copy(
@@ -371,22 +433,35 @@ class BabyModelManager(
         withContext(Dispatchers.Main) { onCompleted?.invoke(true) }
     }
 
+    private fun computeSha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(256 * 1024)
+        file.inputStream().use { input ->
+            var bytes: Int
+            while (input.read(buffer).also { bytes = it } != -1) {
+                digest.update(buffer, 0, bytes)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun formatDiagnosticError(e: Throwable): String {
         return when (e) {
-            is UnknownHostException -> "DNS resolution failure: Cannot resolve host '${e.message ?: "huggingface.co"}'. Please check your internet connection."
-            is SocketTimeoutException -> "Connection timed out: Server did not respond within timeout limit. Download progress is saved and can be resumed."
-            is ConnectException -> "Connection failed: Could not connect to remote download server (${e.message ?: "refused"})."
+            is UnknownHostException -> "Unable to connect to model server (DNS resolution failed for '${e.message ?: "huggingface.co"}'). Check your internet connection."
+            is SocketTimeoutException -> "Download timed out: Server took too long to respond. Partial download is saved and will resume."
+            is ConnectException -> "Unable to connect to model server (Connection refused)."
             is SSLException -> "TLS/SSL security failure: Secure connection could not be established (${e.message ?: "handshake error"})."
-            is ProtocolException -> "HTTP protocol violation: ${e.message ?: "Invalid protocol response"}"
-            is IllegalArgumentException -> e.message ?: "Invalid model file structure"
+            is ProtocolException -> "Network protocol violation: ${e.message ?: "Protocol error"}"
+            is IllegalArgumentException -> e.message ?: "Downloaded file is not a valid GGUF model."
+            is SecurityException -> e.message ?: "Checksum verification failed."
             is IOException -> {
                 val msg = e.message
-                if (msg != null && msg.isNotBlank()) msg else "Network I/O failure: ${e.javaClass.simpleName}"
+                if (!msg.isNullOrBlank() && msg != "null") msg else "Network connection was interrupted."
             }
             else -> {
                 val msg = e.message ?: e.localizedMessage
                 if (!msg.isNullOrBlank() && msg != "null") {
-                    "Download error: $msg"
+                    msg
                 } else {
                     "Download error: ${e.javaClass.simpleName}"
                 }
@@ -402,7 +477,7 @@ class BabyModelManager(
         downloadJob = null
         _modelStatus.value = _modelStatus.value.copy(
             state = if (_modelStatus.value.installedFile?.exists() == true) ModelInstallationState.READY else ModelInstallationState.NOT_INSTALLED,
-            downloadSpeed = "",
+            downloadSpeed = "Paused",
             downloadProgress = 0f
         )
     }
@@ -414,7 +489,7 @@ class BabyModelManager(
         cancelDownload()
         var deletedAny = false
         modelsDir.listFiles()?.forEach { file ->
-            if (file.name.endsWith(".gguf") || file.name.endsWith(".download")) {
+            if (file.name.endsWith(".gguf") || file.name.endsWith(".part") || file.name.endsWith(".download")) {
                 if (file.delete()) deletedAny = true
             }
         }

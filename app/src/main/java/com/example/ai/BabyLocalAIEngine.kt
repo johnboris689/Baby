@@ -247,7 +247,7 @@ class BabyLocalAIEngine(
         userMemories: List<String> = emptyList()
     ): Flow<String> = flow {
         if (!isModelLoaded) {
-            emit("⚠️ No on-device neural model is currently installed or loaded. Please open Settings > Local On-Device AI Engine to download and activate a model (${modelManager.activeModelDescriptor.name} or Baby Compact) for local offline AI conversation.")
+            emit("Local AI model unavailable. Please open Settings > Local On-Device AI Engine to download and install ${modelManager.activeModelDescriptor.name} (or Baby Compact) to enable local on-device inference.")
             return@flow
         }
 
