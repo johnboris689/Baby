@@ -194,44 +194,46 @@ class BabyModelManager(
     fun startDownload(onCompleted: ((Boolean) -> Unit)? = null) {
         if (_modelStatus.value.state == ModelInstallationState.DOWNLOADING) return
 
-        refreshStorageInfo()
-
-        val targetFile = File(modelsDir, activeModelDescriptor.filename)
-        val partFile = File(modelsDir, "${activeModelDescriptor.filename}.part")
-
-        // 1. If complete valid model file already exists, do not re-download
-        if (isValidGgufFile(targetFile)) {
-            Log.d(tag, "Model already fully downloaded and valid: ${targetFile.absolutePath}")
-            _modelStatus.value = _modelStatus.value.copy(
-                state = ModelInstallationState.READY,
-                installedFile = targetFile,
-                downloadProgress = 1f,
-                downloadSpeed = "Installed",
-                isReady = true,
-                errorMessage = null,
-                verificationDetails = "GGUF Binary Verified (${targetFile.length() / (1024 * 1024)} MB)"
-            )
-            onModelInstalledListener?.invoke(targetFile)
-            ioScope.launch(Dispatchers.Main) { onCompleted?.invoke(true) }
-            return
-        }
-
-        // 2. Storage check
-        val existingBytes = if (partFile.exists()) partFile.length() else 0L
-        val remainingBytes = (activeModelDescriptor.sizeBytes - existingBytes).coerceAtLeast(0L)
-        val requiredMb = (remainingBytes / (1024 * 1024)) + 100L
-        if (_modelStatus.value.freeStorageMb < requiredMb) {
-            val error = "Not enough storage: ${activeModelDescriptor.name} requires ~${requiredMb} MB free space, but only ${_modelStatus.value.freeStorageMb} MB is free on device."
-            _modelStatus.value = _modelStatus.value.copy(
-                state = ModelInstallationState.ERROR,
-                errorMessage = error
-            )
-            ioScope.launch(Dispatchers.Main) { onCompleted?.invoke(false) }
-            return
-        }
-
-        // 3. Launch download strictly on Dispatchers.IO
         downloadJob = ioScope.launch(Dispatchers.IO) {
+            refreshStorageInfo()
+
+            val targetFile = File(modelsDir, activeModelDescriptor.filename)
+            val partFile = File(modelsDir, "${activeModelDescriptor.filename}.part")
+
+            // 1. If complete valid model file already exists, do not re-download
+            if (isValidGgufFile(targetFile)) {
+                Log.d(tag, "Model already fully downloaded and valid: ${targetFile.absolutePath}")
+                _modelStatus.value = _modelStatus.value.copy(
+                    state = ModelInstallationState.READY,
+                    installedFile = targetFile,
+                    downloadProgress = 1f,
+                    downloadSpeed = "Installed",
+                    isReady = true,
+                    errorMessage = null,
+                    verificationDetails = "GGUF Binary Verified (${targetFile.length() / (1024 * 1024)} MB)"
+                )
+                withContext(Dispatchers.Main) {
+                    onModelInstalledListener?.invoke(targetFile)
+                    onCompleted?.invoke(true)
+                }
+                return@launch
+            }
+
+            // 2. Storage check
+            val existingBytes = if (partFile.exists()) partFile.length() else 0L
+            val remainingBytes = (activeModelDescriptor.sizeBytes - existingBytes).coerceAtLeast(0L)
+            val requiredMb = (remainingBytes / (1024 * 1024)) + 100L
+            if (_modelStatus.value.freeStorageMb < requiredMb) {
+                val error = "Not enough storage: ${activeModelDescriptor.name} requires ~${requiredMb} MB free space, but only ${_modelStatus.value.freeStorageMb} MB is free on device."
+                _modelStatus.value = _modelStatus.value.copy(
+                    state = ModelInstallationState.ERROR,
+                    errorMessage = error
+                )
+                withContext(Dispatchers.Main) { onCompleted?.invoke(false) }
+                return@launch
+            }
+
+            // 3. Begin download on background I/O
             _modelStatus.value = _modelStatus.value.copy(
                 state = ModelInstallationState.DOWNLOADING,
                 downloadProgress = if (existingBytes > 0 && activeModelDescriptor.sizeBytes > 0) {

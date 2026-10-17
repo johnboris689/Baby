@@ -862,11 +862,15 @@ class BabyViewModel(
 
     fun downloadModel(onComplete: ((Boolean) -> Unit)? = null) {
         selfTestResult.value = null
-        modelManager.startDownload { success ->
-            if (success) {
-                reloadLocalModel()
+        viewModelScope.launch(Dispatchers.IO) {
+            modelManager.startDownload { success ->
+                if (success) {
+                    reloadLocalModel()
+                }
+                viewModelScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke(success)
+                }
             }
-            onComplete?.invoke(success)
         }
     }
 
@@ -876,30 +880,42 @@ class BabyViewModel(
 
     fun deleteModel(): Boolean {
         selfTestResult.value = null
-        val deleted = modelManager.deleteInstalledModel()
-        localEngine.tryLoadInstalledModel()
-        return deleted
+        viewModelScope.launch(Dispatchers.IO) {
+            modelManager.deleteInstalledModel()
+            localEngine.tryLoadInstalledModel()
+        }
+        return true
     }
 
     fun selectModel(model: ModelDescriptor) {
         selfTestResult.value = null
-        modelManager.selectModel(model)
-        localEngine.tryLoadInstalledModel()
+        viewModelScope.launch(Dispatchers.IO) {
+            modelManager.selectModel(model)
+            localEngine.tryLoadInstalledModel()
+        }
     }
 
     fun reloadLocalModel() {
-        val res = localEngine.tryLoadInstalledModel()
-        if (res is LocalModelLoadResult.Success) {
-            selfTestResult.value = "Model Verified (${res.metadata.architecture}, ${res.metadata.tensorCount} tensors, ctx: ${res.metadata.contextLength}). Self-test response:\n\"${res.selfTestResponse}\""
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = localEngine.tryLoadInstalledModel()
+            withContext(Dispatchers.Main) {
+                if (res is LocalModelLoadResult.Success) {
+                    selfTestResult.value = "Model Verified (${res.metadata.architecture}, ${res.metadata.tensorCount} tensors, ctx: ${res.metadata.contextLength}). Self-test response:\n\"${res.selfTestResponse}\""
+                }
+            }
         }
     }
 
     fun runModelSelfTest() {
-        val res = localEngine.tryLoadInstalledModel()
-        selfTestResult.value = when (res) {
-            is LocalModelLoadResult.Success -> "Self-Test PASSED (${res.metadata.architecture}, ${res.metadata.tensorCount} tensors, ctx: ${res.metadata.contextLength}):\n${res.selfTestResponse}"
-            is LocalModelLoadResult.NotInstalled -> "Self-Test FAILED: No model weights installed."
-            is LocalModelLoadResult.Failure -> "Self-Test FAILED: ${res.error}"
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = localEngine.tryLoadInstalledModel()
+            withContext(Dispatchers.Main) {
+                selfTestResult.value = when (res) {
+                    is LocalModelLoadResult.Success -> "Self-Test PASSED (${res.metadata.architecture}, ${res.metadata.tensorCount} tensors, ctx: ${res.metadata.contextLength}):\n${res.selfTestResponse}"
+                    is LocalModelLoadResult.NotInstalled -> "Self-Test FAILED: No model weights installed."
+                    is LocalModelLoadResult.Failure -> "Self-Test FAILED: ${res.error}"
+                }
+            }
         }
     }
 
